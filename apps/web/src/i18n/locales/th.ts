@@ -3253,6 +3253,7 @@ export const th: Dict = {
   'fileViewer.exportImage': 'ส่งออกเป็นรูปภาพ',
   'fileViewer.exportPptxImages': 'ส่งออกเป็น PPTX (รูปภาพ)',
   'fileViewer.exportPptxEditable': 'ส่งออกเป็น PPTX (แก้ไขได้)',
+  "fileViewer.exportPptxBrowserEditable": "แก้ไขได้ในเบราว์เซอร์",
   'fileViewer.exportPptxEditableHint': 'Native editable shapes & text (not pixel-perfect)',
   'fileViewer.exportPptxModalSubtitle': "Choose how to export, then download.",
   'fileViewer.exportPptxScreenshot': "Screenshot PPTX",

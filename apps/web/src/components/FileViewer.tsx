@@ -162,6 +162,7 @@ import {
   exportProjectAsHtml,
   exportProjectAsPdf,
   exportProjectAsPptx,
+  exportDeckAsPptxInBrowser,
   exportProjectAsZip,
   exportProjectImageDataUrl,
   exportProjectScreenshotPdf,
@@ -181,6 +182,8 @@ import {
   type ImageExportFormat,
 } from '../runtime/exports';
 import { fetchAppVersionInfo } from '../providers/registry';
+import { clientPptxAvailable } from '../runtime/clientPptxExport';
+import { pptxExportRoute } from '../runtime/client-pptx-protocol';
 import { copyToClipboard } from '../lib/copy-to-clipboard';
 import { buildReactComponentSrcdoc } from '../runtime/react-component';
 import { shouldConsumeSlideNav } from '../runtime/slide-nav';
@@ -7591,7 +7594,9 @@ function HtmlViewer({
               return;
             }
             void finish('success');
-            if (toastFormats.has(format)) setExportToast({ message: t('fileViewer.exportDone'), tone: 'success' });
+            const warnings = result && typeof result === 'object' && 'warnings' in result
+              && Array.isArray(result.warnings) ? result.warnings.filter((warning): warning is string => typeof warning === 'string') : [];
+            if (toastFormats.has(format)) setExportToast({ message: [t('fileViewer.exportDone'), ...warnings].join('\n'), tone: 'success' });
           },
           (err) => {
             void finish('failed', exportErrorCode(err));
@@ -9119,6 +9124,18 @@ function HtmlViewer({
   // carryover — reintroduces the replica-of-remote-state problem this shape
   // exists to avoid.
   const [slideRendererAvailable, setSlideRendererAvailable] = useState<boolean | null>(null);
+  const [browserPptxAvailable, setBrowserPptxAvailable] = useState(false);
+  const [browserPptxBusy, setBrowserPptxBusy] = useState(false);
+  const browserPptxAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => browserPptxAbort.current?.abort(), [projectId, file.name]);
+  useEffect(() => {
+    if (!((deployMenuOpen && unifiedActionTab === 'export') || pptxExportModalOpen)) return;
+    let cancelled = false;
+    void clientPptxAvailable().then((available) => {
+      if (!cancelled) setBrowserPptxAvailable(available);
+    });
+    return () => { cancelled = true; };
+  }, [deployMenuOpen, unifiedActionTab, pptxExportModalOpen]);
   useEffect(() => {
     const exportSurfaceVisible =
       (deployMenuOpen && unifiedActionTab === 'export') || pptxExportModalOpen;
@@ -14998,16 +15015,10 @@ function HtmlViewer({
   // PPTX export is slide-based, so show it only for explicit decks plus
   // structured deck runtimes. Do not key this off plain `.slide`: ordinary
   // parallax/long pages may use that class but must remain page-mode exports.
-  // ...and only when the daemon on the other end can actually render slides.
-  // The route this button calls hard-fails with 501 when `desktopSlideRenderer`
-  // is absent (headless / container deployments), and both modes in the export
-  // modal reach that same 501, so without this the user is offered an action —
-  // and a mode choice — that cannot succeed. `null` means the daemon has not
-  // answered or predates the flag: keep showing the entry, since hiding on
-  // absence would take a working export away from every deployment that has
-  // not upgraded. Only an explicit `false` hides it.
-  const showPptxExport = canShare && deckExportSignal && slideRendererAvailable !== false;
-  const canPptx = showPptxExport && !streaming;
+  // 无服务端渲染器时，仅在客户端引擎可用后开放浏览器导出。
+  const pptxRoute = pptxExportRoute(slideRendererAvailable, browserPptxAvailable);
+  const showPptxExport = canShare && deckExportSignal && pptxRoute !== null;
+  const canPptx = showPptxExport && !streaming && !browserPptxBusy;
   const showMarkdownExport = source !== null && isMarkdownArtifact && !viewerOnly;
   const showImageExport = canShare;
   // Read-only viewer of a team-shared project: comment-only copy for the
@@ -18000,7 +18011,7 @@ function HtmlViewer({
                   {([
                     {
                       value: 'editable' as const,
-                      title: t('fileViewer.exportPptxEditable'),
+                      title: pptxRoute === 'browser' ? t('fileViewer.exportPptxBrowserEditable') : t('fileViewer.exportPptxEditable'),
                       hint: t('fileViewer.exportPptxEditableHint'),
                       recommended: true,
                     },
@@ -18010,7 +18021,7 @@ function HtmlViewer({
                       hint: t('fileViewer.exportPptxScreenshotHint'),
                       recommended: false,
                     },
-                  ]).map((opt) => (
+                  ]).filter((opt) => pptxRoute !== 'browser' || opt.value === 'editable').map((opt) => (
                     <label
                       key={opt.value}
                       className={`pptx-export-mode-option${pptxExportMode === opt.value ? ' active' : ''}`}
@@ -18050,6 +18061,24 @@ function HtmlViewer({
                   const editable = pptxExportMode === 'editable';
                   setPptxExportModalOpen(false);
                   fireShareExport('pptx', async () => {
+                    if (pptxRoute === 'browser') {
+                      if (!deckVisualSource) throw new Error('Deck source unavailable');
+                      const controller = new AbortController();
+                      browserPptxAbort.current = controller;
+                      setBrowserPptxBusy(true);
+                      try {
+                        const sourceHtml = await inlineRelativeAssets(deckVisualSource, projectId, file.name, projectFilePathSet, workspaceContext);
+                        return await exportDeckAsPptxInBrowser({
+                          sourceHtml,
+                          baseHref: latestSrcDocPreviewBaseHref,
+                          fileName: exportTitle,
+                          signal: controller.signal,
+                        });
+                      } finally {
+                        browserPptxAbort.current = null;
+                        setBrowserPptxBusy(false);
+                      }
+                    }
                     const res = await exportProjectAsPptx({
                       projectId,
                       fileName: file.name,

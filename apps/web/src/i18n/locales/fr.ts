@@ -3253,6 +3253,7 @@ export const fr: Dict = {
   'fileViewer.exportImage': 'Exporter en image',
   'fileViewer.exportPptxImages': 'Exporter en PPTX (images)',
   'fileViewer.exportPptxEditable': 'Exporter en PPTX (modifiable)',
+  "fileViewer.exportPptxBrowserEditable": "Modifiable dans le navigateur",
   'fileViewer.exportPptxEditableHint': 'Formes et texte natifs modifiables (pas au pixel près)',
   'fileViewer.exportPptxModalSubtitle': 'Choisissez le mode d’export, puis téléchargez.',
   'fileViewer.exportPptxScreenshot': 'PPTX en captures d’écran',

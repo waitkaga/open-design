@@ -3253,6 +3253,7 @@ export const fa: Dict = {
   'fileViewer.exportImage': 'صادرکردن به صورت تصویر',
   'fileViewer.exportPptxImages': 'خروجی به‌صورت PPTX (تصاویر)',
   'fileViewer.exportPptxEditable': 'خروجی به‌صورت PPTX (قابل ویرایش)',
+  "fileViewer.exportPptxBrowserEditable": "قابل ویرایش در مرورگر",
   'fileViewer.exportPptxEditableHint': 'Native editable shapes & text (not pixel-perfect)',
   'fileViewer.exportPptxModalSubtitle': "Choose how to export, then download.",
   'fileViewer.exportPptxScreenshot': "Screenshot PPTX",

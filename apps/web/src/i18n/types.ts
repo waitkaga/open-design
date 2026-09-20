@@ -4169,6 +4169,7 @@ export interface Dict {
   'fileViewer.exportImage': string;
   'fileViewer.exportPptxImages': string;
   'fileViewer.exportPptxEditable': string;
+  'fileViewer.exportPptxBrowserEditable': string;
   'fileViewer.exportPptxEditableHint': string;
   'fileViewer.exportPptxModalSubtitle': string;
   'fileViewer.exportPptxScreenshot': string;

@@ -67,6 +67,7 @@ import {
 import { isApprovedFontStylesheetHref } from './deck-thumbnail-parser';
 
 export type SrcdocOptions = {
+  exportPptxScripts?: { bundle: string; bridge: string };
   deck?: boolean;
   baseHref?: string;
   initialSlideIndex?: number;
@@ -429,9 +430,14 @@ export function buildSrcdoc(
   // Embed the reload counter so the srcdoc string differs across reloads even
   // when the underlying HTML bytes are identical.  This ensures the browser
   // sees a changed `srcdoc` attribute and re-parses the document (issue #4650).
-  return options.reloadKey !== undefined
-    ? withTransport.replace(/(<html\b)([^>]*>)/i, `$1 data-od-reload-key="${options.reloadKey}"$2`)
+  const withPptx = options.exportPptxScripts
+    ? injectAfterHeadOpen(withTransport,
+      `<script>${options.exportPptxScripts.bundle.replace(/<\/script/gi, '<\\/script')}</script>` +
+      `<script>${options.exportPptxScripts.bridge.replace(/<\/script/gi, '<\\/script')}</script>`)
     : withTransport;
+  return options.reloadKey !== undefined
+    ? withPptx.replace(/(<html\b)([^>]*>)/i, `$1 data-od-reload-key="${options.reloadKey}"$2`)
+    : withPptx;
 }
 
 /**

@@ -12,6 +12,7 @@ import type {
 } from '@open-design/host';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ANNOTATION_EVENT } from '../../src/components/PreviewDrawOverlay';
+import * as clientPptx from '../../src/runtime/clientPptxExport';
 
 const { saveTemplateMock } = vi.hoisted(() => ({
   saveTemplateMock: vi.fn(),
@@ -7486,6 +7487,30 @@ describe('FileViewer SVG artifacts', () => {
       await gate;
     });
     expect(screen.getByRole('menuitem', { name: /Export as PPTX/i })).toBeTruthy();
+  });
+
+  it('offers only Browser Editable with no renderer and uses a separate browser export', async () => {
+    stubVersionFetch(() => versionResponse({ slideRenderer: false }));
+    vi.spyOn(clientPptx, 'clientPptxAvailable').mockResolvedValue(true);
+    const exported = vi.spyOn(clientPptx, 'exportDeckAsPptxInBrowser').mockResolvedValue({ warnings: [] });
+    const { container } = render(
+      <FileViewer projectId="project-1" projectKind="prototype" file={deckFile()} liveHtml={DECK_HTML} />,
+    );
+    await openUnifiedExportTab();
+    fireEvent.click(await screen.findByRole('menuitem', { name: /Export as PPTX/i }));
+    const dialog = await screen.findByRole('dialog', { name: /Export as PPTX/i });
+    await waitFor(() => expect(within(dialog).getAllByRole('radio')).toHaveLength(1));
+    expect(within(dialog).getByText('Browser Editable')).toBeTruthy();
+    const previews = [...container.querySelectorAll('iframe')].map((frame) => ({ frame, src: frame.src, srcdoc: frame.srcdoc }));
+    fireEvent.click(within(dialog).getByRole('button', { name: /^Export$/i }));
+    await waitFor(() => expect(exported).toHaveBeenCalledOnce());
+    expect(exported).toHaveBeenCalledWith(expect.objectContaining({ sourceHtml: expect.stringContaining('One'), baseHref: expect.any(String), fileName: 'slides' }));
+    for (const { frame, src, srcdoc } of previews) {
+      expect(frame.isConnected).toBe(true);
+      expect(frame.src).toBe(src);
+      expect(frame.srcdoc).toBe(srcdoc);
+    }
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('/export/pptx'))).toBe(false);
   });
 
   it('keeps the PPTX entry when the capability field is absent', async () => {

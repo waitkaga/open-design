@@ -3425,6 +3425,7 @@ export const zhCN: Dict = {
   "fileViewer.exportImage": "导出为图片",
   "fileViewer.exportPptxImages": "导出为 PPTX（图片）",
   "fileViewer.exportPptxEditable": "导出为 PPTX（可编辑）",
+  "fileViewer.exportPptxBrowserEditable": "浏览器可编辑",
   "fileViewer.exportPptxEditableHint": "原生可编辑形状与文字(非像素级还原)",
   "fileViewer.exportPptxModalSubtitle": "选择导出方式后点击导出。",
   "fileViewer.exportPptxScreenshot": "截图 PPTX",

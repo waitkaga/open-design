@@ -956,6 +956,8 @@ export type ProjectScreenshotExportResult =
 // and assembles a one-image-per-slide .pptx, then streams the bytes back for a
 // blob download. Replaces the old "send a prompt and let the agent run
 // python-pptx" path. `format: 'pdf'` produces the raster (screenshot) PDF.
+export { exportDeckAsPptxInBrowser } from './clientPptxExport';
+
 export async function exportProjectAsPptx(opts: {
   projectId: string;
   fileName: string;

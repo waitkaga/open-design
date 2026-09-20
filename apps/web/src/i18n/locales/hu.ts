@@ -3253,6 +3253,7 @@ export const hu: Dict = {
   'fileViewer.exportImage': 'Exportálás képként',
   'fileViewer.exportPptxImages': 'Exportálás PPTX-ként (képek)',
   'fileViewer.exportPptxEditable': 'Exportálás PPTX-ként (szerkeszthető)',
+  "fileViewer.exportPptxBrowserEditable": "Böngészőben szerkeszthető",
   'fileViewer.exportPptxEditableHint': 'Native editable shapes & text (not pixel-perfect)',
   'fileViewer.exportPptxModalSubtitle': "Choose how to export, then download.",
   'fileViewer.exportPptxScreenshot': "Screenshot PPTX",

@@ -3253,6 +3253,7 @@ export const ja: Dict = {
   'fileViewer.exportImage': '画像としてエクスポート',
   'fileViewer.exportPptxImages': 'PPTX（画像）として書き出し',
   'fileViewer.exportPptxEditable': 'PPTX（編集可能）として書き出し',
+  "fileViewer.exportPptxBrowserEditable": "ブラウザー編集可能",
   'fileViewer.exportPptxEditableHint': 'Native editable shapes & text (not pixel-perfect)',
   'fileViewer.exportPptxModalSubtitle': "Choose how to export, then download.",
   'fileViewer.exportPptxScreenshot': "Screenshot PPTX",

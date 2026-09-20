@@ -3253,6 +3253,7 @@ export const ko: Dict = {
   'fileViewer.exportImage': '이미지로 내보내기',
   'fileViewer.exportPptxImages': 'PPTX(이미지)로 내보내기',
   'fileViewer.exportPptxEditable': 'PPTX(편집 가능)로 내보내기',
+  "fileViewer.exportPptxBrowserEditable": "브라우저 편집 가능",
   'fileViewer.exportPptxEditableHint': 'Native editable shapes & text (not pixel-perfect)',
   'fileViewer.exportPptxModalSubtitle': "Choose how to export, then download.",
   'fileViewer.exportPptxScreenshot': "Screenshot PPTX",

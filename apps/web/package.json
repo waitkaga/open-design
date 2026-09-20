@@ -21,8 +21,8 @@
     "src"
   ],
   "scripts": {
-    "dev": "next dev --turbopack",
-    "build": "next build",
+    "dev": "node scripts/build-client-pptx.ts && next dev --turbopack",
+    "build": "node scripts/build-client-pptx.ts && next build",
     "build:sidecar": "tsc -p tsconfig.sidecar.json",
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run -c vitest.config.ts --maxWorkers=2"

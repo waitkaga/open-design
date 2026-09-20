@@ -103,3 +103,8 @@ deploy/agent-bins/
 # Python bytecode from workflow helper self-checks / local compile.
 __pycache__/
 *.py[cod]
+
+# Controlled browser PPTX build products.
+apps/web/public/vendor/dom-to-pptx.bundle.js
+apps/web/public/vendor/pptx-export-bridge.js
+apps/web/public/vendor/client-pptx.json

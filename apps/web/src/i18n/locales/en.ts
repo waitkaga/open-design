@@ -3267,6 +3267,7 @@ export const en: Dict = {
   'fileViewer.exportImage': 'Export as image',
   'fileViewer.exportPptxImages': 'Export as PPTX (images)',
   'fileViewer.exportPptxEditable': 'Export as PPTX (editable)',
+  "fileViewer.exportPptxBrowserEditable": "Browser Editable",
   'fileViewer.exportPptxEditableHint': 'Native editable shapes & text (not pixel-perfect)',
   'fileViewer.exportPptxModalSubtitle': "Choose how to export, then download.",
   'fileViewer.exportPptxScreenshot': "Screenshot PPTX",

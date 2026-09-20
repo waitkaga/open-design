@@ -3253,6 +3253,7 @@ export const tr: Dict = {
   'fileViewer.exportImage': 'Görsel olarak dışa aktar',
   'fileViewer.exportPptxImages': 'PPTX olarak dışa aktar (görseller)',
   'fileViewer.exportPptxEditable': 'PPTX olarak dışa aktar (düzenlenebilir)',
+  "fileViewer.exportPptxBrowserEditable": "Tarayıcıda düzenlenebilir",
   'fileViewer.exportPptxEditableHint': 'Native editable shapes & text (not pixel-perfect)',
   'fileViewer.exportPptxModalSubtitle': "Choose how to export, then download.",
   'fileViewer.exportPptxScreenshot': "Screenshot PPTX",

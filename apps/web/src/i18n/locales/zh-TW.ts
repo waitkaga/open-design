@@ -3434,6 +3434,7 @@ export const zhTW: Dict = {
   "fileViewer.exportImage": "匯出為圖片",
   "fileViewer.exportPptxImages": "匯出為 PPTX（圖片）",
   "fileViewer.exportPptxEditable": "匯出為 PPTX（可編輯）",
+  "fileViewer.exportPptxBrowserEditable": "瀏覽器可編輯",
   "fileViewer.exportPptxEditableHint": "原生可編輯形狀與文字(非像素級還原)",
   "fileViewer.exportPptxModalSubtitle": "選擇匯出方式後點擊匯出。",
   "fileViewer.exportPptxScreenshot": "截圖 PPTX",

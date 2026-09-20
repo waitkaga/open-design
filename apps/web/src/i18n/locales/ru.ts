@@ -3253,6 +3253,7 @@ export const ru: Dict = {
   'fileViewer.exportImage': 'Экспорт как изображение',
   'fileViewer.exportPptxImages': 'Экспорт в PPTX (изображения)',
   'fileViewer.exportPptxEditable': 'Экспорт в PPTX (редактируемый)',
+  "fileViewer.exportPptxBrowserEditable": "Редактируемый в браузере",
   'fileViewer.exportPptxEditableHint': 'Нативные редактируемые фигуры и текст (не pixel-perfect)',
   'fileViewer.exportPptxModalSubtitle': "Выберите способ экспорта, затем скачайте файл.",
   'fileViewer.exportPptxScreenshot': "PPTX из снимков",
