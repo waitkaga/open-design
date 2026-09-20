@@ -21,6 +21,8 @@ import { readFileSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
+import type { OdNextRolloutMode } from '@open-design/contracts';
+
 import { expandHomePrefix } from './home-expansion.js';
 
 import {
@@ -77,6 +79,7 @@ export function readPluginEnvKnobs(): PluginEnvKnobs {
 export interface AgentModelPrefs {
   model?: string;
   reasoning?: string;
+  serviceTier?: string;
 }
 
 export type AgentCliEnvPrefs = Record<string, Record<string, string>>;
@@ -92,6 +95,10 @@ export interface OrbitConfigPrefs {
   enabled: boolean;
   time: string;
   templateSkillId?: string | null;
+  workspaceScope?: {
+    workspaceId: string;
+    workspaceMemberId: string;
+  } | null;
 }
 
 export interface ProjectLocationPrefs {
@@ -113,10 +120,17 @@ export interface AppConfigPrefs {
   installationId?: string | null;
   telemetry?: TelemetryPrefs;
   privacyDecisionAt?: number | null;
+  allowSilentUpdates?: boolean;
   orbit?: OrbitConfigPrefs;
   customInstructions?: string | null;
   projectLocations?: ProjectLocationPrefs[];
   defaultProjectLocationId?: string | null;
+  // Whether this installation runs the OD Next design strategy. Absent and
+  // null both mean "unconfigured", which resolves to `active` — OD Next is the
+  // default route and this key is how an installation opts out of it.
+  // `OD_NEXT_STRATEGY_ROLLOUT` outranks this when set; see
+  // readOdNextRolloutPolicy.
+  odNextStrategyMode?: OdNextRolloutMode | null;
   // Most-recently-used local working directories the user granted the agent
   // read access to from the Home composer. Become a project's
   // `metadata.linkedDirs` (read-only `--add-dir` awareness, no Design Files
@@ -141,10 +155,12 @@ const ALLOWED_KEYS: ReadonlySet<keyof AppConfigPrefs> = new Set([
   'installationId',
   'telemetry',
   'privacyDecisionAt',
+  'allowSilentUpdates',
   'orbit',
   'customInstructions',
   'projectLocations',
   'defaultProjectLocationId',
+  'odNextStrategyMode',
   'recentLinkedDirs',
 ] as const);
 
@@ -161,7 +177,11 @@ export function appConfigDir(projectRoot: string, env: NodeJS.ProcessEnv = proce
   return path.isAbsolute(expanded) ? expanded : path.resolve(projectRoot, expanded);
 }
 
-const AGENT_MODEL_KEYS: ReadonlySet<string> = new Set(['model', 'reasoning']);
+const AGENT_MODEL_KEYS: ReadonlySet<string> = new Set([
+  'model',
+  'reasoning',
+  'serviceTier',
+]);
 const RETIRED_AGENT_IDS: ReadonlySet<string> = new Set(['gemini']);
 
 const TELEMETRY_KEYS: ReadonlySet<string> = new Set([
@@ -312,6 +332,23 @@ function validateOrbit(raw: unknown): OrbitConfigPrefs | undefined {
     orbit.templateSkillId = typeof obj.templateSkillId === 'string' && obj.templateSkillId.trim()
       ? obj.templateSkillId.trim()
       : null;
+  }
+  if (Object.hasOwn(obj, 'workspaceScope')) {
+    const rawScope = obj.workspaceScope;
+    if (rawScope && typeof rawScope === 'object' && !Array.isArray(rawScope)) {
+      const workspaceId =
+        typeof (rawScope as Record<string, unknown>).workspaceId === 'string'
+          ? ((rawScope as Record<string, unknown>).workspaceId as string).trim()
+          : '';
+      const workspaceMemberId =
+        typeof (rawScope as Record<string, unknown>).workspaceMemberId === 'string'
+          ? ((rawScope as Record<string, unknown>).workspaceMemberId as string).trim()
+          : '';
+      orbit.workspaceScope =
+        workspaceId && workspaceMemberId ? { workspaceId, workspaceMemberId } : null;
+    } else {
+      orbit.workspaceScope = null;
+    }
   }
 
   return orbit;
@@ -562,9 +599,30 @@ function applyConfigValue(
     }
     return;
   }
+  if (key === 'allowSilentUpdates') {
+    if (typeof value === 'boolean') {
+      target[key] = value;
+    } else {
+      delete target[key];
+    }
+    return;
+  }
   if (key === 'orbit') {
     const validated = validateOrbit(value);
     if (validated !== undefined) {
+      const existingOrbit = target[key] as OrbitConfigPrefs | undefined;
+      if (
+        value
+        && typeof value === 'object'
+        && !Array.isArray(value)
+        && !Object.hasOwn(value, 'workspaceScope')
+        && existingOrbit?.workspaceScope
+      ) {
+        // Older clients do not know this field. Editing Orbit time/enabled
+        // must not silently convert an already-scoped unattended automation
+        // back into an ambient/unbound one. An explicit null still clears it.
+        validated.workspaceScope = existingOrbit.workspaceScope;
+      }
       target[key] = validated;
     } else {
       delete target[key];
@@ -597,6 +655,23 @@ function applyConfigValue(
     }
     return;
   }
+  if (key === 'odNextStrategyMode') {
+    // Reached with a non-mode value only on the READ path — a truncated file, a
+    // hand edit, a value written by some other version. It must not take the
+    // daemon down, and it must not read as unconfigured either: see
+    // OD_NEXT_MODE_WHEN_CONFIG_UNREADABLE. `null` is different and stays a
+    // delete, because clearing the key IS the deliberate way back to the
+    // default. The WRITE path never reaches here with a bad value —
+    // `assertWritableControlValues` refuses it first.
+    if (value === 'off' || value === 'observe' || value === 'active') {
+      target[key] = value;
+    } else if (value === null || value === undefined) {
+      delete target[key];
+    } else {
+      target[key] = OD_NEXT_MODE_WHEN_CONFIG_UNREADABLE;
+    }
+    return;
+  }
   if (key === 'recentLinkedDirs') {
     if (Array.isArray(value)) {
       // Keep non-empty strings, trim, de-dupe preserving most-recent-first
@@ -621,6 +696,34 @@ function applyConfigValue(
     return;
   }
 }
+
+/**
+ * What this installation's OD Next preference reads as when the field is there
+ * but cannot be understood.
+ *
+ * Scoped deliberately narrow: this covers `odNextStrategyMode` holding a value
+ * that is not one of the modes — a hand edit, a typo, a mode some other version
+ * writes. Something was configured and we cannot read it, and since flipping
+ * the default made unconfigured mean `active`, dropping it would turn "we
+ * cannot read your choice" into "you chose OD Next".
+ *
+ * It deliberately does NOT cover a config file that fails to parse at all, or
+ * one whose body is not an object. Those reset every preference to its default
+ * — agent, telemetry, everything — and singling this one out to resolve against
+ * its default would be inconsistent with the rest of the file and would opt
+ * installations out of a rollout they never declined. A broken file is not
+ * evidence of an opt-out; it is evidence of a broken file, and the user has
+ * lost the whole config either way.
+ *
+ * The narrow case still has the property worth having: a user who never opted
+ * out is unaffected, because a readable config keeps its value and a fresh
+ * install has no key at all.
+ *
+ * This is a claim about one field, not about the user, so it is deliberately
+ * not reported as a distinct mode source: `readOdNextRolloutPolicy` sees a
+ * saved `off` and says `app_config`, which is true — a config is what decided.
+ */
+const OD_NEXT_MODE_WHEN_CONFIG_UNREADABLE = 'off' as const;
 
 function filterAllowedKeys(obj: Record<string, unknown>): AppConfigPrefs {
   const result: Record<string, unknown> = Object.create(null);
@@ -761,10 +864,47 @@ export async function writeAppConfig(
   }
 }
 
+/** Thrown by `writeAppConfig` when a control key is handed a value it cannot mean. */
+export class InvalidAppConfigValueError extends Error {
+  readonly code = 'INVALID_APP_CONFIG_VALUE';
+
+  constructor(public readonly key: string, message: string) {
+    super(message);
+    this.name = 'InvalidAppConfigValueError';
+  }
+}
+
+/**
+ * Refuse a write that names a control key with a value that is not one of its
+ * modes.
+ *
+ * Every other preference here is sanitized by dropping what it cannot store,
+ * and that is the right trade for a preference: the cost of a bad value is one
+ * setting falling back to its default. `odNextStrategyMode` is not a
+ * preference — it decides whether OD Next runs at all, and its default is
+ * `active`, so dropping it is not a neutral outcome. It revokes an opt-out,
+ * which means `od config set odNextStrategyMode of` would put the installation
+ * back on OD Next while printing success, and the person who typed it would go
+ * on believing they had opted out.
+ *
+ * So a typo fails loudly instead. `null` stays a legitimate value: clearing the
+ * key IS the deliberate way to return to the default.
+ */
+function assertWritableControlValues(partial: Record<string, unknown>): void {
+  if (!Object.prototype.hasOwnProperty.call(partial, 'odNextStrategyMode')) return;
+  const value = partial.odNextStrategyMode;
+  if (value === null || value === 'off' || value === 'observe' || value === 'active') return;
+  throw new InvalidAppConfigValueError(
+    'odNextStrategyMode',
+    'odNextStrategyMode must be one of "off", "observe", "active", or null',
+  );
+}
+
 async function doWrite(
   dataDir: string,
   partial: Record<string, unknown>,
 ): Promise<AppConfigPrefs> {
+  assertWritableControlValues(partial);
   const existing = await readAppConfig(dataDir);
   const next: Record<string, unknown> = { ...existing };
   for (const key of Object.keys(partial)) {
@@ -781,19 +921,37 @@ async function doWrite(
   const tmp = file + '.' + randomBytes(4).toString('hex') + '.tmp';
   await writeFile(tmp, JSON.stringify(normalizedNextWithoutRetiredAgents, null, 2), 'utf8');
   await rename(tmp, file);
+  const installationIdWasExplicitlyReset = Object.prototype.hasOwnProperty.call(partial, 'installationId')
+    && (partial.installationId == null || (
+      typeof existing.installationId === 'string'
+      && typeof normalizedNextWithoutRetiredAgents.installationId === 'string'
+      && existing.installationId !== normalizedNextWithoutRetiredAgents.installationId
+    ));
+  const metricsWereExplicitlyDisabled = isMetricsExplicitlyDisabled(partial.telemetry);
+  const shouldClearAttribution = installationIdWasExplicitlyReset || metricsWereExplicitlyDisabled;
   // Mirror the identity bits to the channel-root installation file so they
   // survive a namespace-scoped data-dir wipe. Only fires when the caller
-  // explicitly touched `installationId` (avoiding noisy writes on every
-  // unrelated app-config update). A write failure here doesn't roll back
-  // the app-config write — the next read merges them transparently.
-  if (Object.prototype.hasOwnProperty.call(partial, 'installationId')) {
+  // explicitly touches installation identity or consent lifecycle state
+  // (avoiding noisy writes on every unrelated app-config update). A write
+  // failure here doesn't roll back the app-config write — the next read
+  // merges them transparently.
+  if (Object.prototype.hasOwnProperty.call(partial, 'installationId') || shouldClearAttribution) {
     const id = normalizedNextWithoutRetiredAgents.installationId;
     // Caller explicitly touched installationId — mirror the outcome
     // (including the clear case) to installation.json so a future read
     // doesn't keep serving the old value out of the channel-root file.
     // "Delete my data" relies on this clear path.
     const installPatch: InstallationFilePatch = {
-      installationId: typeof id === 'string' && id.length > 0 ? id : null,
+      ...(Object.prototype.hasOwnProperty.call(partial, 'installationId')
+        ? { installationId: typeof id === 'string' && id.length > 0 ? id : null }
+        : {}),
+      ...(shouldClearAttribution
+        ? {
+            pendingAttribution: null,
+            attributionClaimedAt: null,
+            attributionClaimResultAt: null,
+          }
+        : {}),
     };
     try {
       await writeInstallationFile(resolveInstallationDir(dataDir), installPatch);
@@ -803,4 +961,11 @@ async function doWrite(
     }
   }
   return normalizedNextWithoutRetiredAgents;
+}
+
+function isMetricsExplicitlyDisabled(value: unknown): boolean {
+  return value != null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (value as Record<string, unknown>).metrics === false;
 }

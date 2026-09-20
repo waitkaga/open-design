@@ -1,7 +1,27 @@
+import { afterEach } from 'vitest';
+import { configure } from '@testing-library/react';
+
 // Extend vitest's expect with @testing-library/jest-dom matchers (e.g.
 // toBeInTheDocument, toHaveTextContent) so jsdom-environment tests can use
 // them without importing jest-dom in every test file.
 import '@testing-library/jest-dom/vitest';
+
+import { resetPluginsCache } from '../../src/state/projects';
+
+// Failure budget for waitFor/findBy under CI CPU contention — not expected
+// duration. Recent Web workspace flakes clustered at 1015–1093ms, so 3s gives
+// useful runner slack while staying below Vitest's 5s per-test limit. Keep this
+// below the outer test timeout so Testing Library can still print its assertion
+// and DOM diagnostics when a wait genuinely fails.
+configure({ asyncUtilTimeout: 3_000 });
+
+// The visible-plugins cache is module-level so it survives Home remounts in the
+// app (a deliberate perf choice). In tests that persistence would leak a case's
+// mocked `/api/plugins` payload into the next case via `listPluginsFresh`, so
+// clear it after every case — each test then observes only its own mock.
+afterEach(() => {
+  resetPluginsCache();
+});
 
 // jsdom does not implement geometry for Range/Element, but Lexical's
 // `updateDOMSelection` calls `getBoundingClientRect()` on the collapsed
@@ -45,4 +65,15 @@ if (typeof window !== 'undefined') {
   ) {
     Element.prototype.scrollIntoView = () => {};
   }
+}
+
+// jsdom has no 2D canvas backend, so every `getContext('2d')` call emits a
+// "Not implemented" jsdomError on the virtual console. Components that draw
+// (SpaceBackground, the kinetic grid, thumbnail rasterization) already treat a
+// null context as "no canvas, skip drawing", so return null quietly instead of
+// burying real diagnostics under one warning per render. Suites that need a
+// drawable canvas still `vi.spyOn(HTMLCanvasElement.prototype, 'getContext')`.
+if (typeof window !== 'undefined' && typeof HTMLCanvasElement !== 'undefined') {
+  HTMLCanvasElement.prototype.getContext =
+    (() => null) as unknown as HTMLCanvasElement['getContext'];
 }

@@ -1,4 +1,5 @@
 const DEFAULT_CHAT_RUN_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_CHAT_RUN_FIRST_OUTPUT_TIMEOUT_MS = 0;
 const MAX_CHAT_RUN_INACTIVITY_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_CHAT_RUN_ARTIFACT_QUIET_PERIOD_MS = 60 * 1000;
 
@@ -7,6 +8,16 @@ export function assertValidRuntimeDefInactivityTimeoutMs(agentDefault?: number):
   if (!Number.isFinite(agentDefault) || agentDefault < 0 || !Number.isInteger(agentDefault)) {
     throw new RangeError(
       `RuntimeAgentDef.inactivityTimeoutMs must be a non-negative integer, got ${String(agentDefault)}. ` +
+        'Fix the runtime def — invalid values used to silently disable the watchdog.',
+    );
+  }
+}
+
+export function assertValidRuntimeDefFirstOutputTimeoutMs(agentDefault?: number): void {
+  if (agentDefault === undefined) return;
+  if (!Number.isFinite(agentDefault) || agentDefault < 0 || !Number.isInteger(agentDefault)) {
+    throw new RangeError(
+      `RuntimeAgentDef.firstOutputTimeoutMs must be a non-negative integer, got ${String(agentDefault)}. ` +
         'Fix the runtime def — invalid values used to silently disable the watchdog.',
     );
   }
@@ -22,6 +33,18 @@ export function resolveChatRunInactivityTimeoutMs(agentDefault?: number) {
     return Math.min(MAX_CHAT_RUN_INACTIVITY_TIMEOUT_MS, agentDefault);
   }
   return DEFAULT_CHAT_RUN_INACTIVITY_TIMEOUT_MS;
+}
+
+export function resolveChatRunFirstOutputTimeoutMs(agentDefault?: number): number {
+  assertValidRuntimeDefFirstOutputTimeoutMs(agentDefault);
+  const env = Number(process.env.OD_CHAT_RUN_FIRST_OUTPUT_TIMEOUT_MS);
+  if (Number.isFinite(env)) {
+    return Math.min(MAX_CHAT_RUN_INACTIVITY_TIMEOUT_MS, Math.max(0, Math.floor(env)));
+  }
+  if (agentDefault !== undefined) {
+    return Math.min(MAX_CHAT_RUN_INACTIVITY_TIMEOUT_MS, agentDefault);
+  }
+  return DEFAULT_CHAT_RUN_FIRST_OUTPUT_TIMEOUT_MS;
 }
 
 export function resolveChatRunArtifactQuietPeriodMs() {
@@ -92,20 +115,77 @@ export function applyClaudeStreamJsonRunBookkeeping(
     name?: unknown;
     id?: unknown;
     stopReason?: unknown;
+    isError?: unknown;
   };
 
-  const cleanTerminalTurn =
+  const terminalTurn =
     (event.type === 'turn_end' && event.stopReason !== 'tool_use') ||
     (event.type === 'usage' && event.stopReason !== 'tool_use');
-  if (!cleanTerminalTurn) return;
+  if (!terminalTurn) return;
 
-  run.turnCompletedCleanly = true;
+  // An error termination (is_error result frame) ends the turn — stdin must
+  // still close — but it is NOT a clean completion: marking it clean lets
+  // classifyChatRunCloseStatus translate the CLI's non-zero exit into
+  // 'succeeded' and the failure never reaches the user. A SessionEnd-hook
+  // non-zero exit after a normal result (#3373) carries no isError flag and
+  // keeps taking the clean path.
+  const errorTermination = event.type === 'usage' && event.isError === true;
+  if (!errorTermination) {
+    run.turnCompletedCleanly = true;
+  }
   if (run.stdinOpen) {
     if (run.child?.stdin && !run.child.stdin.destroyed) {
       try { run.child.stdin.end(); } catch {}
     }
     run.stdinOpen = false;
   }
+}
+
+/**
+ * Whether an emission from a runtime adapter counts as *agent progress* for the
+ * inactivity clock (`run.lastAgentActivityAt`, exported to analytics as
+ * `last_progress_age_ms`).
+ *
+ * Only bytes the agent produced count. Everything the daemon manufactures while
+ * closing out a turn is excluded, because stamping the progress clock from our
+ * own bookkeeping means the last recorded "progress" is the very act of giving
+ * up — so `last_progress_age_ms` reads near zero on exactly the stalled runs
+ * whose contract says it must read "near the inactivity ceiling" (see
+ * TrackingRunFinished in packages/contracts). That is what made the 2026-07-28
+ * AMR design-system stall (run 14b04dd3, ~30 minutes of silence, reported age
+ * 664ms) look like a run that was still working when it was killed.
+ *
+ * Two kinds of emission are ours, not the agent's:
+ *
+ * 1. A terminal `error` — the daemon reporting its own verdict (an ACP
+ *    stage-watchdog timeout, a protocol failure we detected, a close with no
+ *    result).
+ * 2. Any emission flagged `hostSynthesized` — currently the terminal
+ *    `tool_use`/`tool_result` pair the ACP bridge writes for a tool the agent
+ *    left open (`flushOpenAcpTools`). These ride the normal `agent` channel and
+ *    are otherwise indistinguishable from real tool traffic, and they are
+ *    emitted on every ACP failure path immediately BEFORE the terminal error —
+ *    so excluding only case 1 still lets a stall that died with a tool in
+ *    flight report a near-zero age. That is the common stall shape, not an
+ *    edge case.
+ *
+ * Agent-originated errors are not lost by this: they arrive on the child's
+ * stdout/stderr, and those raw-chunk handlers stamp the clock already.
+ *
+ * This predicate only covers emissions that reach the daemon BEFORE the verdict
+ * — `fail()` flushes open tools and only then sends the error. Everything that
+ * arrives after it (the child's shutdown line on stderr, diagnostics promoted
+ * from it) is handled by the attempt-scoped freeze in `startChatRun`; see
+ * `freezeProgressClock`. The two together are one rule: the progress clock runs
+ * from the agent's bytes and stops when the daemon gives up.
+ */
+export function runtimeEmissionCountsAsAgentProgress(
+  channel: string,
+  meta?: { hostSynthesized?: boolean },
+): boolean {
+  if (channel === 'error') return false;
+  if (meta?.hostSynthesized === true) return false;
+  return true;
 }
 
 export function resolveChatRunShutdownGraceMs() {
@@ -225,4 +305,50 @@ export function bufferedAntigravityGeminiFirstTokenAt(
     offset = nextOffset;
   }
   return null;
+}
+
+/**
+ * Whether a runtime reads its whole prompt as plain text from stdin (and then
+ * waits for EOF). Those runtimes get the prompt as a complete file-backed stdin
+ * at spawn — see `openCompletePromptAsStdin` in `agent-process.ts`.
+ *
+ * Excluded are the runtimes whose stdin carries a framed protocol instead:
+ * Claude's `stream-json` input (stdin stays open for mid-turn messages),
+ * pi-rpc, dsh-profile JSONL, ACP / Codex app-server JSON-RPC (those set
+ * `promptViaStdin: false`). A frame cut short by a dying daemon does not parse,
+ * so they cannot act on a partial prompt the way a plain-text reader does.
+ */
+export function runtimeReadsPlainTextPromptFromStdin(def: {
+  promptViaStdin?: boolean;
+  promptInputFormat?: string;
+  streamFormat?: string;
+}): boolean {
+  return (
+    def.promptViaStdin === true
+    && def.streamFormat !== 'pi-rpc'
+    && def.streamFormat !== 'dsh-profile-jsonl'
+    && (def.promptInputFormat ?? 'text') !== 'stream-json'
+  );
+}
+
+/**
+ * Stdin telemetry for a prompt handed over as the child's file-backed stdin
+ * at spawn.
+ *
+ * The prompt was complete on disk before the child existed, so the daemon's
+ * side of the write is finished the moment the child is spawned: it cannot be
+ * backpressured (`stdin_backpressure` is false by construction — a child that
+ * never reads its stdin now stalls in its own first-token wait, not in a daemon
+ * write), and `stdin_write_start`/`stdin_write_end` land together, in their
+ * historical position after spawn, so phase math and the Langfuse
+ * `stdin-write` span keep their shape.
+ */
+export function recordPromptDeliveredAtSpawn(
+  run: { stdinBackpressure?: boolean },
+  lifecycle: { mark: (mark: 'model_call_start' | 'stdin_write_start' | 'stdin_write_end') => void },
+): void {
+  lifecycle.mark('model_call_start');
+  lifecycle.mark('stdin_write_start');
+  lifecycle.mark('stdin_write_end');
+  run.stdinBackpressure = false;
 }

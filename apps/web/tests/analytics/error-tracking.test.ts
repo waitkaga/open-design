@@ -3,11 +3,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  classifyBrowserOsName,
   clearExceptionTrackingContext,
   installErrorHandlers,
   patchExceptionTrackingAppVersion,
   reportHandledException,
-  setExceptionTrackingContext,
+  reportSafetyEvent,
+  setExceptionTrackingContext as setProductionExceptionTrackingContext,
 } from '../../src/analytics/error-tracking';
 
 /**
@@ -28,6 +30,25 @@ const fetchMock = vi.fn();
 
 const ORIGINAL_FETCH = globalThis.fetch;
 
+function setExceptionTrackingContext(
+  next: {
+    apiKey: string;
+    host: string;
+    distinctId: string;
+    appVersion?: string;
+    sessionId?: string;
+    telemetryEnv?: string;
+    clientType?: 'web' | 'desktop' | 'external_mcp';
+    osName?: 'Mac OS X' | 'Windows' | 'Linux' | 'Android' | 'iOS' | 'Chrome OS' | 'unknown';
+  },
+): void {
+  setProductionExceptionTrackingContext({
+    clientType: 'web',
+    osName: 'Mac OS X',
+    ...next,
+  });
+}
+
 beforeEach(() => {
   fetchMock.mockReset();
   fetchMock.mockResolvedValue(new Response('', { status: 200 }));
@@ -38,6 +59,7 @@ beforeEach(() => {
 afterEach(() => {
   clearExceptionTrackingContext();
   globalThis.fetch = ORIGINAL_FETCH;
+  delete (globalThis as { _posthogChunkIds?: Record<string, string> })._posthogChunkIds;
 });
 
 function lastFetchedBody(): Record<string, unknown> {
@@ -48,6 +70,20 @@ function lastFetchedBody(): Record<string, unknown> {
 }
 
 describe('error-tracking', () => {
+  it.each([
+    ['MacIntel', 'Mozilla/5.0 (Macintosh)', 0, 'Mac OS X'],
+    ['Win32', 'Mozilla/5.0 (Windows NT 10.0)', 0, 'Windows'],
+    ['Linux x86_64', 'Mozilla/5.0 (X11; Linux x86_64)', 0, 'Linux'],
+    ['Linux armv8l', 'Mozilla/5.0 (Linux; Android 15)', 0, 'Android'],
+    ['iPhone', 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0)', 5, 'iOS'],
+    ['MacIntel', 'Mozilla/5.0 (Macintosh)', 5, 'iOS'],
+  ])(
+    'classifies browser signals for %s',
+    (platform, userAgent, maxTouchPoints, expected) => {
+      expect(classifyBrowserOsName({ platform, userAgent, maxTouchPoints })).toBe(expected);
+    },
+  );
+
   it('buffers captures dispatched before a context is set, then flushes', async () => {
     installErrorHandlers();
 
@@ -73,6 +109,7 @@ describe('error-tracking', () => {
       properties: expect.objectContaining({
         $exception_type: 'Error',
         $exception_message: 'early-boom',
+        event_schema_version: 4,
         app_version: '1.2.3',
         session_id: 'session-abc',
       }),
@@ -95,6 +132,68 @@ describe('error-tracking', () => {
       $exception_message: 'immediate',
       handled: true,
     });
+  });
+
+  it('stamps OS and client type on direct safety events', () => {
+    setExceptionTrackingContext({
+      apiKey: 'phc_test',
+      host: 'https://us.i.posthog.com',
+      distinctId: 'user-platform-metadata',
+      clientType: 'desktop',
+      osName: 'Mac OS X',
+    });
+
+    reportSafetyEvent('client_boot_timing', { duration_ms: 42 });
+
+    expect(lastFetchedBody().properties).toMatchObject({
+      $os: 'Mac OS X',
+      client_type: 'desktop',
+      duration_ms: 42,
+    });
+  });
+
+  it('stamps chunk_id on frames whose chunk registered one, so PostHog can match the uploaded sourcemap', () => {
+    // Mirror what `@posthog/cli sourcemap inject` registers at chunk load:
+    // key = the chunk's own Error().stack, value = its chunk id. The stack is
+    // multi-frame — the injected IIFE (newest, the chunk itself) sits above a
+    // webpack runtime frame (older) — so the id MUST key onto the newest
+    // frame's file (page-abc.js), not the outermost one. A loop that picked
+    // the wrong end would key it onto webpack-runtime.js and leave page-abc.js
+    // unmatched.
+    (globalThis as { _posthogChunkIds?: Record<string, string> })._posthogChunkIds = {
+      [[
+        'Error',
+        '    at od://app/_next/static/chunks/page-abc.js:1:100',
+        '    at __webpack_require__ (od://app/_next/static/chunks/webpack-runtime.js:2:200)',
+      ].join('\n')]: 'chunk-page-abc',
+    };
+    setExceptionTrackingContext({
+      apiKey: 'phc_test',
+      host: 'https://us.i.posthog.com',
+      distinctId: 'user-chunk',
+    });
+
+    const err = new Error('kaboom');
+    // Two frames: the first is from the chunk that registered an id, the
+    // second from a chunk that did not.
+    err.stack = [
+      'Error: kaboom',
+      '    at render (od://app/_next/static/chunks/page-abc.js:42:13)',
+      '    at commit (od://app/_next/static/chunks/framework-xyz.js:7:9)',
+    ].join('\n');
+    reportHandledException(err);
+
+    const body = lastFetchedBody();
+    const list = (body.properties as Record<string, unknown>).$exception_list as Array<{
+      stacktrace?: { frames?: Array<Record<string, unknown>> };
+    }>;
+    const frames = list[0]?.stacktrace?.frames ?? [];
+    const withChunkId = frames.filter((f) => typeof f.chunk_id === 'string');
+    // Exactly the frame from the registered chunk is stamped — and with the
+    // id PostHog will use to locate the uploaded map. No spurious ids leak
+    // onto frames whose chunk never registered one.
+    expect(withChunkId).toHaveLength(1);
+    expect(withChunkId[0]!.chunk_id).toBe('chunk-page-abc');
   });
 
   it('captures unhandledrejection events via the window hook', () => {
@@ -417,5 +516,85 @@ describe('error-tracking', () => {
 
     // No second beacon — the loop is broken.
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Attribution guards for the un-typable exception.
+ *
+ * The stability report's frontend Top 5 carries a row literally rendered as
+ * `Error  — 235 次 / ~74 台`: an exception with a type but no value, which no
+ * amount of dashboard work can turn into a cause. Two independent sources:
+ *
+ *   1. `buildExceptionList` copied `error.name` / `error.message` straight
+ *      through, and both can legitimately be '' (a bare `new Error()`, or a
+ *      subclass whose `name` a minifier mangled away).
+ *   2. `parseStack` returned `[]` for a stackless error. PostHog derives
+ *      `$exception_types` / `$exception_values` from `$exception_list` at
+ *      ingestion and drops entries failing frame validation, so a zero-frame
+ *      entry lands with neither field set — this is how a cross-origin
+ *      "Script error." disappears.
+ */
+describe('exception attribution', () => {
+  beforeEach(() => {
+    setExceptionTrackingContext({
+      apiKey: 'phc_test',
+      host: 'https://us.i.posthog.com',
+      distinctId: 'user-attrib',
+    });
+  });
+
+  it('never ships an empty exception value for a message-less Error', () => {
+    reportHandledException(new Error(''));
+
+    const props = lastFetchedBody().properties as Record<string, unknown>;
+    const list = props.$exception_list as Array<{ type: string; value: string }>;
+    expect(list[0]!.type).not.toBe('');
+    expect(list[0]!.value).not.toBe('');
+    expect(props.$exception_message).not.toBe('');
+  });
+
+  it('never ships an empty exception type when the name was mangled away', () => {
+    const mangled = new Error('boom');
+    Object.defineProperty(mangled, 'name', { value: '', configurable: true });
+
+    reportHandledException(mangled);
+
+    const list = (lastFetchedBody().properties as Record<string, unknown>)
+      .$exception_list as Array<{ type: string; value: string }>;
+    expect(list[0]!.type).toBe('Error');
+    expect(list[0]!.value).toBe('boom');
+  });
+
+  it.each([
+    ['missing stack', undefined],
+    ['empty stack', ''],
+    ['header-only stack', 'Error: Script error.'],
+    ['unparseable stack', 'some vendor noise\nmore noise'],
+  ])('ships a non-empty stacktrace for a %s', (_label, stackValue) => {
+    const err = new Error('Script error.');
+    if (stackValue === undefined) {
+      delete (err as { stack?: string }).stack;
+    } else {
+      Object.defineProperty(err, 'stack', { value: stackValue, configurable: true });
+    }
+
+    reportHandledException(err);
+
+    const list = (lastFetchedBody().properties as Record<string, unknown>)
+      .$exception_list as Array<{ stacktrace?: { frames?: unknown[] } }>;
+    expect(list[0]!.stacktrace?.frames?.length).toBeGreaterThan(0);
+  });
+
+  it('ships a synthetic frame rather than a zero-frame stacktrace', () => {
+    // A cross-origin "Script error.": no stack, no filename, nothing to parse.
+    const stackless = new Error('Script error.');
+    delete (stackless as { stack?: string }).stack;
+
+    reportHandledException(stackless);
+
+    const list = (lastFetchedBody().properties as Record<string, unknown>)
+      .$exception_list as Array<{ stacktrace?: { frames?: unknown[] } }>;
+    expect(list[0]!.stacktrace?.frames?.length).toBeGreaterThan(0);
   });
 });

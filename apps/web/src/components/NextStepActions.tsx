@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { ChatSessionMode } from '@open-design/contracts';
+import { MAX_NEXT_STEP_SUGGESTIONS } from '@open-design/contracts';
 import { useI18n } from '../i18n';
 import { localizeSkillDescription, localizeSkillName } from '../i18n/content';
 import type { Dict } from '../i18n/types';
@@ -10,12 +11,9 @@ import { Icon, type IconName } from './Icon';
 import {
   DESIGN_TOOLBOX_ACTIONS,
   FEATURED_DESIGN_TOOLBOX_ACTION_IDS,
-  designToolboxActionBadge,
-  designToolboxActionDescription,
   designToolboxActionMatchesQuery,
   designToolboxActionTitle,
   findDesignToolboxSkill,
-  getDesignToolboxAction,
   skillMatchesQuery,
   type DesignToolboxAction,
   type DesignToolboxActionId,
@@ -55,7 +53,7 @@ export const PROJECT_CONTINUE_PROMPT =
   'Continue from the stopped or incomplete turn. Read the conversation, current project files, and any visible errors, then take the next concrete step. If a primary artifact already exists, update it in place; otherwise create the missing primary artifact and summarize what changed.';
 
 export const PROJECT_GENERATE_ARTIFACT_PROMPT =
-  'Generate the missing project artifact now. Use the current conversation and project context to create the primary previewable deliverable, usually index.html unless another file type is clearly requested. Save it into this project and include a concise summary of the files created.';
+  'Generate the missing project artifact now. Use the current conversation and project context to create the primary previewable deliverable. Save it with a short semantic filename derived from the request, such as investor-pitch-deck.html, refund-dashboard.html, or pricing-page.html; use index.html only for a fixed runtime convention or a launcher/overview. Save it into this project and include a concise summary of the files created.';
 
 export const PROJECT_INCOMPLETE_NEXT_STEP_ACTIONS = [
   {
@@ -221,11 +219,28 @@ interface Props {
   // MCP/plugins/connectors/files; this next-step flyout keeps the same shape
   // while using the resource data already owned by the chat pane.
   skills?: SkillSummary[];
-  // Resolved `@skill` names per featured action, shown in the hover detail.
-  toolboxSkillNames?: Partial<Record<DesignToolboxActionId, string | null>>;
-  // Contribute the artifact to the Open Design community gallery.
+  // Contribute the artifact to the OpenDesign community gallery.
   onShareToOpenDesign?: () => void;
   shareToOpenDesignBusy?: boolean;
+  /**
+   * This turn's follow-up suggestions, written by the agent about what it just
+   * built and parsed out of its `<od-next key="…">` marker by the daemon.
+   *
+   * The `default` variant renders ONLY these — the fixed toolbox directory it
+   * used to render is gone. AssistantMessage may supply the OPEND-2776 image
+   * actions for a successful image delivery. An empty list means "render nothing":
+   * there is deliberately no fallback to a catalogue, because a turn recorded
+   * before this existed has no suggestions and a generic row under it would be
+   * a worse answer than silence.
+   */
+  suggestions?: string[];
+  /**
+   * Seed the composer with one suggestion. The user may edit it and must send
+   * explicitly; clicking a suggestion must never persist a message or create a
+   * run by itself. The rows carry no trailing chevron because they do not open
+   * another menu.
+   */
+  onSuggestion?: (text: string) => void;
   variant?: NextStepActionsVariant;
 }
 
@@ -272,9 +287,11 @@ type PlanAction = (typeof PLAN_NEXT_STEP_ACTIONS)[number];
 type PromptNextStepAction =
   | (typeof DESIGN_SYSTEM_NEXT_STEP_ACTIONS)[number]
   | (typeof PROJECT_INCOMPLETE_NEXT_STEP_ACTIONS)[number];
-type Detail =
-  | ({ kind: 'toolbox'; id: DesignToolboxActionId } & Anchor)
-  | ({ kind: 'brand'; id: BrandExtractionActionId } & Anchor);
+/**
+ * 悬停详情卡只剩品牌那一支了 —— 工具箱那一支跟着精选行一起删了
+ * (`default` 这一档整档换成了 agent 现写的三条建议)。
+ */
+type Detail = { id: BrandExtractionActionId } & Anchor;
 
 function isPlanFileName(fileName: string | null | undefined): boolean {
   return !!fileName && /\.mdx?$/i.test(fileName);
@@ -303,7 +320,7 @@ function promptActionPrompt(action: PromptNextStepAction, locale: string): strin
     case 'project-continue':
       return '从已停止或未完成的回合继续处理。先阅读当前对话、项目文件和可见错误，再执行下一个具体步骤。如果主产物已经存在，就在原文件上更新；否则创建缺失的主产物，并简要总结改了什么。';
     case 'project-generate-artifact':
-      return '现在生成缺失的项目产物。基于当前对话和项目上下文创建主要的可预览交付物；除非明确要求其他文件类型，通常保存为 index.html。把文件保存到当前项目中，并简要说明创建了哪些文件。';
+      return '现在生成缺失的项目产物。基于当前对话和项目上下文创建主要的可预览交付物；根据需求保存成简短的语义化文件名，例如 investor-pitch-deck.html、refund-dashboard.html 或 pricing-page.html。只有固定运行时约定或入口概览页才使用 index.html。把文件保存到当前项目中，并简要说明创建了哪些文件。';
     case 'design-system-ai-refine':
       return '使用 AI 提取继续原地优化这个设计系统。读取当前 DESIGN.md、brand.json、source context、tokens、字体、色板、资产和组件套件预览；如果有链接的网站或源文件，请重新测量。保持同一个设计系统 id，不要创建重复系统。重点强化 token 角色、品牌语气、组件指导、明暗主题套件质量和可复用实现说明。最后总结改动和更新的文件。';
     case 'design-system-audit-kit':
@@ -333,15 +350,41 @@ export function NextStepActions({
   createDesignSystemBusy = false,
   onPickSkill,
   skills = [],
-  toolboxSkillNames,
   onShareToOpenDesign,
   shareToOpenDesignBusy = false,
+  suggestions,
+  onSuggestion,
   variant = 'default',
 }: Props) {
   const { t, locale } = useI18n();
   const analytics = useAnalytics();
+
+  /*
+   * 稿子第 41 / 42 格:回合末尾三行**由 agent 现写**的行为引导。
+   *
+   * 这一族原来是固定的工具箱目录(智能匹配下一步 / 设计润色 · 可交付 / 更多),
+   * 产品裁决把它换掉了。只有 `default` 这一档是那份目录 —— 其余几档
+   * (plan / project-incomplete / design-system / brand-*)是各自的恢复流程,
+   * 不在这次裁决范围内,原样保留。
+   *
+   * 调用方负责选择 agent 建议或 OPEND-2776 的成功生图动作。
+   * 没有可用建议时不退回工具箱、不出空壳。
+   */
+  const visibleSuggestions = useMemo(
+    () =>
+      (suggestions ?? [])
+        .map((s) => (typeof s === 'string' ? s.trim() : ''))
+        .filter(Boolean)
+        .slice(0, MAX_NEXT_STEP_SUGGESTIONS),
+    [suggestions],
+  );
+  const isSuggestionVariant = variant === 'default';
+  const renderNothing =
+    isSuggestionVariant && (visibleSuggestions.length === 0 || !onSuggestion);
+
   const exposedRef = useRef(false);
   useEffect(() => {
+    if (renderNothing) return;
     if (exposedRef.current) return;
     exposedRef.current = true;
     trackNextStepActionClick(analytics.track, {
@@ -349,11 +392,13 @@ export function NextStepActions({
       area: 'next_step',
       element: 'next_step_exposed',
     });
-  }, [analytics.track]);
+  }, [analytics.track, renderNothing]);
 
   // Three-level cascading hover menu, all portaled to <body> with fixed
-  // positioning so the narrow chat column never clips or occludes them:
-  //   featured row  → detail card (skill summary)
+  // positioning so the narrow chat column never clips or occludes them.
+  // It belongs to the WORKFLOW variants only — the `default` variant returns
+  // above with the agent-written suggestion rows and never reaches here:
+  //   brand row     → detail card (what the recovery action does)
   //   More          → [Design toolbox, Share]   (level 2)
   //   Design toolbox → search + non-featured actions + global resources (level 3)
   //   Share          → Share / Download / Contribute (level 3)
@@ -385,21 +430,12 @@ export function NextStepActions({
   }, [cancelClose, closeAll]);
   useEffect(() => () => cancelClose(), [cancelClose]);
 
-  const openDetail = useCallback(
-    (id: DesignToolboxActionId, rect: DOMRect) => {
-      cancelClose();
-      setMore(null);
-      setSub(null);
-      setDetail({ kind: 'toolbox', id, ...place(rect, DETAIL_WIDTH, DETAIL_HEIGHT) });
-    },
-    [cancelClose],
-  );
   const openBrandDetail = useCallback(
     (id: BrandExtractionActionId, rect: DOMRect) => {
       cancelClose();
       setMore(null);
       setSub(null);
-      setDetail({ kind: 'brand', id, ...place(rect, DETAIL_WIDTH, DETAIL_HEIGHT) });
+      setDetail({ id, ...place(rect, DETAIL_WIDTH, DETAIL_HEIGHT) });
     },
     [cancelClose],
   );
@@ -429,7 +465,15 @@ export function NextStepActions({
   );
 
   const track = useCallback(
-    (element: 'share' | 'toolbox_action' | 'toolbox_more' | 'share_to_open_design', chipId?: string) => {
+    (
+      element:
+        | 'share'
+        | 'toolbox_action'
+        | 'toolbox_more'
+        | 'share_to_open_design'
+        | 'suggestion',
+      chipId?: string,
+    ) => {
       trackNextStepActionClick(analytics.track, {
         page_name: 'chat_panel',
         area: 'next_step',
@@ -438,6 +482,23 @@ export function NextStepActions({
       });
     },
     [analytics.track],
+  );
+
+  /**
+   * 点一条建议 = 把那句话填入 Composer,等用户确认或改写后显式发送。
+   * 点击本身不能落消息、建 run 或产生费用。行尾没有 `›`,因为它不打开
+   * 下一层菜单,而不是因为会自动发送。
+   *
+   * 上报的是**位置**不是文字:建议是模型现写的、关于用户自己项目的话,
+   * 不该进埋点载荷。
+   */
+  const handleSuggestion = useCallback(
+    (text: string, index: number) => {
+      if (!onSuggestion) return;
+      track('suggestion', String(index));
+      onSuggestion(text);
+    },
+    [onSuggestion, track],
   );
 
   const handleShare = useCallback(() => {
@@ -652,9 +713,52 @@ export function NextStepActions({
   // Hover handlers shared by every flyout surface: stay open while hovered.
   const keepOpen = { onMouseEnter: cancelClose, onMouseLeave: scheduleClose };
 
+  /*
+   * 调用方没给建议 / 给了但一条都用不了 —— 这一行整块不出。
+   * 返回 `null` 而不是空 `<div>`:空容器仍然占版面上的一格,而这一块的分寸
+   * 恰恰是「你想继续时才被看见」。
+   */
+  if (renderNothing) return null;
+
+  if (isSuggestionVariant) {
+    return (
+      <div
+        className={styles.root}
+        data-testid="next-step-actions"
+        role="group"
+        aria-label={t('nextStep.suggestionsLabel')}
+      >
+        <div className={styles.suggestions} data-testid="next-step-suggestions">
+          {visibleSuggestions.map((text, index) => (
+            <button
+              // 文字本身就是身份:同一句话不会在同一轮里出现两次(解析时已去重),
+              // 而下标做 key 会让新一轮的三条复用上一轮的 DOM,过渡跟着串味。
+              key={text}
+              type="button"
+              className={styles.suggestionRow}
+              data-testid={`next-step-suggestion-${index}`}
+              onClick={() => handleSuggestion(text, index)}
+            >
+              {/* 稿子里三行是**同一枚箭头**,没有分类图标、也没有行尾 chevron ——
+                  「有三条」这件事由三个箭头说,不由两道线说。 */}
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M13.9999 19.0001L5.00003 19.0002L5 17.0002L11.9999 17.0001L12 6.8283L8.05027 10.778L6.63606 9.36381L13 2.99985L19.364 9.36381L17.9498 10.778L14 6.82825L13.9999 19.0001Z" />
+              </svg>
+              <span className={styles.suggestionText}>{text}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className={styles.root} data-testid="next-step-actions">
-      <div className={styles.label}>{t('nextStep.title')}</div>
+    <div
+      className={styles.root}
+      data-testid="next-step-actions"
+      role="group"
+      aria-label={t('nextStep.title')}
+    >
       {showBrandRows || showPlanRows || showProjectIncompleteRows || showDesignSystemRows || showToolbox || hasMore ? (
         <div className={styles.toolboxList} data-testid="next-step-toolbox">
           {showPlanRows
@@ -671,12 +775,15 @@ export function NextStepActions({
                     title={description}
                     onClick={() => handlePlanPromptAction(action)}
                   >
-                    <Icon name={action.icon} size={14} className={styles.toolboxRowIcon} />
+                    <Icon name={action.icon} size={12} className={styles.toolboxRowIcon} />
                     <span className={styles.toolboxRowText}>
+                      {/* Title only. The description is a hover reveal (the
+                          detail panel for brand rows, the native tooltip for
+                          the rest) so the list reads as a scannable menu
+                          instead of a wall of two-line paragraphs. */}
                       <span className={styles.toolboxRowTitle}>{title}</span>
-                      <span className={styles.toolboxRowDescription}>{description}</span>
                     </span>
-                    <Icon name="chevron-right" size={13} className={styles.toolboxRowArrow} />
+                    <Icon name="chevron-right" size={12} className={styles.toolboxRowArrow} />
                   </button>
                 );
               })
@@ -705,21 +812,27 @@ export function NextStepActions({
                     aria-busy={busy || undefined}
                     aria-label={`${title}. ${description}`}
                     disabled={busy}
-                    title={description}
+                    // No native `title` here: the hover detail panel below
+                    // already reveals this description, and the browser tooltip
+                    // rendered on top of it — two overlapping popups saying the
+                    // same sentence.
                     onClick={() => handleBrandAction(action)}
                     onMouseEnter={(e) => openBrandDetail(action.id, e.currentTarget.getBoundingClientRect())}
                     onMouseLeave={scheduleClose}
                   >
                     <Icon
                       name={busy ? 'spinner' : action.icon}
-                      size={14}
+                      size={12}
                       className={busy ? 'icon-spin' : styles.toolboxRowIcon}
                     />
                     <span className={styles.toolboxRowText}>
+                      {/* Title only. The description is a hover reveal (the
+                          detail panel for brand rows, the native tooltip for
+                          the rest) so the list reads as a scannable menu
+                          instead of a wall of two-line paragraphs. */}
                       <span className={styles.toolboxRowTitle}>{title}</span>
-                      <span className={styles.toolboxRowDescription}>{description}</span>
                     </span>
-                    <Icon name="chevron-right" size={13} className={styles.toolboxRowArrow} />
+                    <Icon name="chevron-right" size={12} className={styles.toolboxRowArrow} />
                   </button>
                 );
               })
@@ -733,9 +846,9 @@ export function NextStepActions({
                   data-testid={`next-step-project-action-${action.id}`}
                   onClick={() => handlePromptAction(action)}
                 >
-                  <Icon name={action.icon} size={14} className={styles.toolboxRowIcon} />
+                  <Icon name={action.icon} size={12} className={styles.toolboxRowIcon} />
                   <span className={styles.toolboxRowTitle}>{promptActionTitle(action, t)}</span>
-                  <Icon name="chevron-right" size={13} className={styles.toolboxRowArrow} />
+                  <Icon name="chevron-right" size={12} className={styles.toolboxRowArrow} />
                 </button>
               ))
             : null}
@@ -748,38 +861,18 @@ export function NextStepActions({
                   data-testid={`next-step-design-system-action-${action.id}`}
                   onClick={() => handlePromptAction(action)}
                 >
-                  <Icon name={action.icon} size={14} className={styles.toolboxRowIcon} />
+                  <Icon name={action.icon} size={12} className={styles.toolboxRowIcon} />
                   <span className={styles.toolboxRowTitle}>{promptActionTitle(action, t)}</span>
-                  <Icon name="chevron-right" size={13} className={styles.toolboxRowArrow} />
+                  <Icon name="chevron-right" size={12} className={styles.toolboxRowArrow} />
                 </button>
               ))
             : null}
-          {showToolbox && !showDesignSystemRows
-            && !showProjectIncompleteRows
-            && !showBrandRows
-            && !showPlanRows
-            ? FEATURED_DESIGN_TOOLBOX_ACTION_IDS.map((id) => {
-                const action = getDesignToolboxAction(id);
-                if (!action) return null;
-                return (
-                  <button
-                    key={id}
-                    type="button"
-                    className={styles.toolboxRow}
-                    data-testid={`next-step-toolbox-action-${id}`}
-                    onClick={() => handleToolboxAction(id)}
-                    onMouseEnter={(e) => openDetail(id, e.currentTarget.getBoundingClientRect())}
-                    onMouseLeave={scheduleClose}
-                  >
-                    <Icon name={action.icon} size={14} className={styles.toolboxRowIcon} />
-                    <span className={styles.toolboxRowTitle}>
-                      {designToolboxActionTitle(action, t)}
-                    </span>
-                    <Icon name="chevron-right" size={13} className={styles.toolboxRowArrow} />
-                  </button>
-                );
-              })
-            : null}
+          {/* 稿子第 41 / 42 格之前,这里还有两行「精选工具箱」(智能匹配下一步 /
+              设计润色 · 可交付)。它们只在 `default` 这一档出现,而 `default` 现在
+              整档由 agent 现写的三条建议接管,所以这两行没有任何一档还能画到 ——
+              连同它们的 hover 详情卡一起删掉,不留死码。
+              两条动作本身没丢:输入框「+」→ 设计百宝箱里是同一份目录
+              (`ChatComposer` 的 `DesignToolboxPanel`)。 */}
           {hasMore ? (
             <button
               type="button"
@@ -790,36 +883,20 @@ export function NextStepActions({
               onMouseLeave={scheduleClose}
               onClick={(e) => openMore(e.currentTarget.getBoundingClientRect())}
             >
-              <Icon name="more-horizontal" size={14} className={styles.toolboxRowIcon} />
+              <Icon name="more-horizontal" size={12} className={styles.toolboxRowIcon} />
               <span className={styles.toolboxRowTitle}>{t('nextStep.more')}</span>
-              <Icon name="chevron-right" size={13} className={styles.toolboxRowArrow} />
+              <Icon name="chevron-right" size={12} className={styles.toolboxRowArrow} />
             </button>
           ) : null}
         </div>
       ) : null}
-
-      {/* Level: featured-row detail card */}
+      {/* Level: brand-row detail card (the toolbox variant of this card went
+          with the featured rows above). */}
       {detail && typeof document !== 'undefined'
         ? createPortal(
             (() => {
-              if (detail.kind === 'brand') {
-                const action = brandActions.find((item) => item.id === detail.id);
-                if (!action) return null;
-                return (
-                  <div
-                    className={styles.detail}
-                    role="tooltip"
-                    style={{ left: detail.left, top: detail.top }}
-                    {...keepOpen}
-                  >
-                    <div className={styles.detailTitle}>{brandActionTitle(action, t, false)}</div>
-                    <div className={styles.detailDesc}>{brandActionDescription(action, t)}</div>
-                  </div>
-                );
-              }
-              const action = getDesignToolboxAction(detail.id);
+              const action = brandActions.find((item) => item.id === detail.id);
               if (!action) return null;
-              const skillName = toolboxSkillNames?.[detail.id] ?? null;
               return (
                 <div
                   className={styles.detail}
@@ -827,12 +904,8 @@ export function NextStepActions({
                   style={{ left: detail.left, top: detail.top }}
                   {...keepOpen}
                 >
-                  <div className={styles.detailTitle}>{designToolboxActionTitle(action, t)}</div>
-                  <div className={styles.detailDesc}>
-                    {designToolboxActionDescription(action, t)}
-                  </div>
-                  {skillName ? <div className={styles.detailSkill}>@{skillName}</div> : null}
-                  <div className={styles.detailBadge}>{designToolboxActionBadge(action, t)}</div>
+                  <div className={styles.detailTitle}>{brandActionTitle(action, t, false)}</div>
+                  <div className={styles.detailDesc}>{brandActionDescription(action, t)}</div>
                 </div>
               );
             })(),

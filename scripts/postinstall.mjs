@@ -11,6 +11,7 @@ const repoRoot = resolve(scriptDir, "..");
 const buildTargets = [
   "packages/release",
   "packages/contracts",
+  "packages/standalone",
   "packages/components",
   "packages/platform",
   "packages/download",
@@ -22,6 +23,7 @@ const buildTargets = [
   "packages/launcher-proto",
   "packages/sidecar",
   "packages/diagnostics",
+  "packages/dsh-runtime",
   "apps/daemon",
   "tools/dev",
   "tools/pack",
@@ -75,25 +77,6 @@ function availableBuildTargets() {
     targets.push(target);
   }
   return targets;
-}
-
-function runBuildTargetSync(target) {
-  const result = spawnSync(
-    packageManager.command,
-    [...packageManager.argsPrefix, "-C", target, "run", "build"],
-    {
-      cwd: repoRoot,
-      stdio: "inherit",
-    },
-  );
-
-  if (result.error != null) {
-    throw result.error;
-  }
-
-  if (result.status !== 0) {
-    process.exit(result.status ?? 1);
-  }
 }
 
 function runBuildTarget(target) {
@@ -214,13 +197,6 @@ async function runBuildTargetsInParallel(targets, concurrency) {
 async function runBuildTargets() {
   const targets = availableBuildTargets();
   const concurrency = postinstallConcurrency();
-  if (concurrency <= 1) {
-    for (const target of targets) {
-      runBuildTargetSync(target);
-    }
-    return;
-  }
-
   await runBuildTargetsInParallel(targets, concurrency);
 }
 
@@ -240,10 +216,13 @@ try {
 const req = createRequire(resolve(repoRoot, "apps/daemon/package.json"));
 let needsRebuild = false;
 try {
-  req("better-sqlite3");
+  // Try to actually use the native addon; merely requiring the JS wrapper
+  // succeeds even when the binary is missing (e.g. after `pnpm install --ignore-scripts`).
+  const Database = req("better-sqlite3");
+  new Database(":memory:");
 } catch (e) {
   // MODULE_NOT_FOUND means daemon deps aren't installed yet — not our problem.
-  // Any other error (ERR_DLOPEN_FAILED, ABI mismatch, etc.) warrants a rebuild.
+  // Any other error (missing binary, ERR_DLOPEN_FAILED, ABI mismatch, etc.) warrants a rebuild.
   if (e?.code !== "MODULE_NOT_FOUND") {
     needsRebuild = true;
   }

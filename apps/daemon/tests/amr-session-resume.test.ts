@@ -4,7 +4,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { startServer } from '../src/server.js';
 
@@ -54,6 +54,11 @@ describe('AMR (vela) ACP session resume — full server cycle', () => {
   let started: StartedServer | null = null;
   let binDir: string | null = null;
 
+  beforeEach(() => {
+    // These fixtures exercise session transport with plain replies, not OD Next state.
+    process.env.OD_NEXT_STRATEGY_ROLLOUT = 'off';
+  });
+
   afterEach(async () => {
     await Promise.resolve(started?.shutdown?.());
     if (started?.server) {
@@ -64,6 +69,38 @@ describe('AMR (vela) ACP session resume — full server cycle', () => {
     binDir = null;
     restoreEnv(originalEnv);
   });
+
+  it.each(['success', 'pending', 'legacy', 'missing', 'mismatch', 'limit'])(
+    'safely converges compaction continuation: %s', async (scenario) => {
+      binDir = await mkdtemp(path.join(os.tmpdir(), 'od-amr-continuation-'));
+      const bin = path.join(binDir, 'vela');
+      const fixture = path.join(HERE, 'fixtures', 'fake-vela-continuation.ts');
+      const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+      await writeFile(bin, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fixture)} ${quote(scenario)} ${quote(binDir)} "$@"\n`);
+      await chmod(bin, 0o755);
+      clearTelemetryEnv();
+      started = await startServer({ port: 0, returnServer: true }) as StartedServer;
+      await putConfig(started.url, { agentId: 'amr', agentCliEnv: { amr: { VELA_BIN: bin } } });
+      const conversation = await createConversation(started.url);
+      const run = await sendRunAndWait(started.url, conversation, 'write exactly once');
+      expect(run.status, JSON.stringify({ run, events: (await readRunEvents(run.eventsLogPath)).slice(-8) })).toBe(scenario === 'success' ? 'succeeded' : 'failed');
+      const ledger = (await readFile(path.join(binDir, 'ledger.jsonl'), 'utf8')).trim().split('\n')
+        .map((line) => JSON.parse(line));
+      expect(ledger.filter((row) => row.method === 'session/new')).toHaveLength(1);
+      expect(ledger.filter((row) => row.method === 'session/prompt')).toHaveLength(1);
+      expect(await readFile(path.join(binDir, 'tool-executions'), 'utf8')).toBe('write\n');
+      const canAttempt = !['pending', 'legacy'].includes(scenario);
+      expect(ledger.filter((row) => row.method === 'session/load')).toHaveLength(canAttempt ? 1 : 0);
+      const attempts = ledger.filter((row) => row.method === '_session/continue');
+      expect(attempts).toHaveLength(['success', 'limit'].includes(scenario) ? 1 : 0);
+      const events = await readRunEvents(run.eventsLogPath);
+      expect(events.filter((event) => event.event === 'end')).toHaveLength(1);
+      expect(events.filter((event) => event.event === 'run_retry_attempted')).toHaveLength(canAttempt ? 1 : 0);
+      expect(hasDiagnostic(events, { type: 'agent_resume_auto_reseed' })).toBe(false);
+      const final = events.find((event) => event.event === 'run_retry_finished');
+      expect(final?.data).toMatchObject({ retry_result: scenario === 'success' ? 'success' : canAttempt ? 'failed' : 'suppressed' });
+    }, 30_000,
+  );
 
   it('captures the durable handle on turn 1 and resumes it via session/load on turn 2', async () => {
     binDir = await mkdtemp(path.join(os.tmpdir(), 'od-amr-resume-bin-'));
@@ -201,6 +238,50 @@ describe('AMR (vela) ACP session resume — full server cycle', () => {
     expect(await readInvocations(logPath)).toEqual(['new', 'new']);
   });
 
+  it('clears a resumed AMR session after request_too_large so the next turn starts fresh', async () => {
+    binDir = await mkdtemp(path.join(os.tmpdir(), 'od-amr-largecontext-bin-'));
+    const logPath = path.join(binDir, 'invocations.jsonl');
+    const bin = await writeVelaWrapper(binDir, 'vela-largecontext', {
+      logPath,
+      promptErrorOnLoad: '[code=request_too_large] request body exceeds configured limit',
+    });
+
+    clearTelemetryEnv();
+    started = (await startServer({ port: 0, returnServer: true })) as StartedServer;
+    await putConfig(started.url, {
+      agentId: 'amr',
+      agentCliEnv: { amr: { VELA_BIN: bin } },
+      telemetry: { metrics: true, content: false, artifactManifest: false },
+      privacyDecisionAt: Date.now(),
+    });
+
+    const conversationId = await createConversation(started.url);
+
+    // Turn 1 captures the durable upstream OpenCode handle.
+    expect((await sendRunAndWait(started.url, conversationId, 'first request')).status)
+      .toBe('succeeded');
+
+    // Turn 2 resumes that handle, but the upstream request is now too large.
+    // The run should fail honestly, but the daemon must clear the handle so
+    // the next user retry does not load the same overgrown native session.
+    const turn2 = await sendRunAndWait(started.url, conversationId, 'second request');
+    expect(turn2.status).toBe('failed');
+    expect(turn2.error ?? '').toMatch(/request body exceeds configured limit/i);
+
+    const turn2Events = await readRunEvents(turn2.eventsLogPath);
+    expect(hasDiagnostic(turn2Events, {
+      type: 'agent_session_cleared_after_prompt_too_large',
+      reason: 'prompt_too_large',
+      stale_session_cleared: true,
+    })).toBe(true);
+
+    // Turn 3 proves the stale handle was discarded: it opens session/new and
+    // succeeds instead of session/load-ing the same oversized upstream session.
+    expect((await sendRunAndWait(started.url, conversationId, 'third request')).status)
+      .toBe('succeeded');
+    expect(await readInvocations(logPath)).toEqual(['new', 'load', 'new']);
+  });
+
   it('persists the concrete resolved model for a default turn (equivalent explicit follow-up resumes)', async () => {
     binDir = await mkdtemp(path.join(os.tmpdir(), 'od-amr-defaultmodel-bin-'));
     const logPath = path.join(binDir, 'invocations.jsonl');
@@ -231,6 +312,124 @@ describe('AMR (vela) ACP session resume — full server cycle', () => {
       .toBe('succeeded');
 
     expect(await readInvocations(logPath)).toEqual(['new', 'load']);
+  });
+
+  it('resolves an explicit default model to the live catalog default before spawning AMR', async () => {
+    binDir = await mkdtemp(path.join(os.tmpdir(), 'od-amr-explicit-default-bin-'));
+    const logPath = path.join(binDir, 'invocations.jsonl');
+    const bin = await writeVelaWrapper(binDir, 'vela-explicit-default', {
+      logPath,
+      logSetModel: true,
+      requireSetModel: true,
+    });
+
+    clearTelemetryEnv();
+    started = (await startServer({ port: 0, returnServer: true })) as StartedServer;
+    await putConfig(started.url, {
+      agentId: 'amr',
+      agentCliEnv: { amr: { VELA_BIN: bin } },
+      telemetry: { metrics: true, content: false, artifactManifest: false },
+      privacyDecisionAt: Date.now(),
+    });
+
+    const conversationId = await createConversation(started.url);
+
+    expect((await sendRunAndWait(started.url, conversationId, 'use account default', 'default')).status)
+      .toBe('succeeded');
+    expect((await sendRunAndWait(started.url, conversationId, 'use account default again', 'default')).status)
+      .toBe('succeeded');
+
+    expect(await readInvocations(logPath)).toEqual([
+      'new',
+      'set_model:deepseek-v4-flash',
+      'load',
+      'set_model:deepseek-v4-flash',
+    ]);
+  });
+
+  it('uses the catalog default model for omitted AMR model selections, skipping disabled catalog heads', async () => {
+    binDir = await mkdtemp(path.join(os.tmpdir(), 'od-amr-catalog-default-bin-'));
+    const logPath = path.join(binDir, 'invocations.jsonl');
+    const presetCatalog = JSON.stringify({
+      source: 'preset',
+      data: [
+        { id: 'deepseek-v4-flash', enabled: false },
+        { id: 'kimi-k2.6', default: true },
+        { id: 'glm-5.1' },
+      ],
+    });
+    const remoteCatalog = JSON.stringify({
+      source: 'remote',
+      data: [
+        { id: 'deepseek-v4-flash', enabled: false },
+        { id: 'kimi-k2.6', default: true },
+        { id: 'glm-5.1' },
+      ],
+    });
+    const bin = await writeVelaWrapper(binDir, 'vela-catalog-default', {
+      logPath,
+      logSetModel: true,
+      modelPresetJson: presetCatalog,
+      modelListJson: remoteCatalog,
+    });
+
+    clearTelemetryEnv();
+    started = (await startServer({ port: 0, returnServer: true })) as StartedServer;
+    await putConfig(started.url, {
+      agentId: 'amr',
+      agentCliEnv: { amr: { VELA_BIN: bin } },
+      telemetry: { metrics: true, content: false, artifactManifest: false },
+      privacyDecisionAt: Date.now(),
+    });
+
+    const conversationId = await createConversation(started.url);
+
+    expect((await sendRunAndWait(started.url, conversationId, 'use catalog default')).status)
+      .toBe('succeeded');
+
+    expect(await readInvocations(logPath)).toEqual(['new', 'set_model:kimi-k2.6']);
+  });
+
+  it('rejects explicit AMR default when every catalog model is disabled', async () => {
+    binDir = await mkdtemp(path.join(os.tmpdir(), 'od-amr-locked-default-bin-'));
+    const logPath = path.join(binDir, 'invocations.jsonl');
+    const lockedCatalog = JSON.stringify({
+      source: 'preset',
+      data: [
+        { id: 'deepseek-v4-flash', enabled: false },
+        { id: 'kimi-k2.6', enabled: false },
+      ],
+    });
+    const lockedRemoteCatalog = JSON.stringify({
+      source: 'remote',
+      data: [
+        { id: 'deepseek-v4-flash', enabled: false },
+        { id: 'kimi-k2.6', enabled: false },
+      ],
+    });
+    const bin = await writeVelaWrapper(binDir, 'vela-locked-default', {
+      logPath,
+      logSetModel: true,
+      requireSetModel: true,
+      modelPresetJson: lockedCatalog,
+      modelListJson: lockedRemoteCatalog,
+    });
+
+    clearTelemetryEnv();
+    started = (await startServer({ port: 0, returnServer: true })) as StartedServer;
+    await putConfig(started.url, {
+      agentId: 'amr',
+      agentCliEnv: { amr: { VELA_BIN: bin } },
+      telemetry: { metrics: true, content: false, artifactManifest: false },
+      privacyDecisionAt: Date.now(),
+    });
+
+    const conversationId = await createConversation(started.url);
+    const run = await sendRunAndWait(started.url, conversationId, 'use account default', 'default');
+
+    expect(run.status).toBe('failed');
+    expect(run.errorCode).toBe('AMR_MODEL_UNAVAILABLE');
+    expect(await readInvocations(logPath)).toEqual([]);
   });
 
   it('reseeds a fresh session (no resume) when the model changes between turns', async () => {
@@ -270,18 +469,39 @@ describe('AMR (vela) ACP session resume — full server cycle', () => {
 async function writeVelaWrapper(
   dir: string,
   name: string,
-  opts: { logPath: string; resumeFailed?: boolean; omitHandle?: boolean },
+  opts: {
+    logPath: string;
+    resumeFailed?: boolean;
+    omitHandle?: boolean;
+    promptErrorOnLoad?: string;
+    logSetModel?: boolean;
+    requireSetModel?: boolean;
+    modelPresetJson?: string;
+    modelListJson?: string;
+  },
 ): Promise<string> {
   const bin = path.join(dir, name);
   const lines = [
     '#!/bin/sh',
     `export FAKE_VELA_INVOCATION_LOG=${JSON.stringify(opts.logPath)}`,
-    // Isolate the resume cycle from the set_model gate; the strict-set_model
-    // contract is covered by amr-acp-integration.test.ts.
-    'export FAKE_VELA_REQUIRE_SET_MODEL=0',
   ];
+  if (opts.requireSetModel !== true) {
+    // Isolate most resume-cycle tests from the set_model gate; individual
+    // default-model regressions opt back into the production-shaped strict gate.
+    lines.push('export FAKE_VELA_REQUIRE_SET_MODEL=0');
+  }
   if (opts.resumeFailed) lines.push('export FAKE_VELA_RESUME_FAILED=1');
   if (opts.omitHandle) lines.push('export FAKE_VELA_OMIT_OPENCODE_SESSION_ID=1');
+  if (opts.promptErrorOnLoad) {
+    lines.push(`export FAKE_VELA_PROMPT_ERROR_ON_LOAD=${JSON.stringify(opts.promptErrorOnLoad)}`);
+  }
+  if (opts.logSetModel) lines.push('export FAKE_VELA_LOG_SET_MODEL=1');
+  if (opts.modelPresetJson) {
+    lines.push(`export FAKE_VELA_MODEL_PRESET_JSON=${JSON.stringify(opts.modelPresetJson)}`);
+  }
+  if (opts.modelListJson) {
+    lines.push(`export FAKE_VELA_MODEL_LIST_JSON=${JSON.stringify(opts.modelListJson)}`);
+  }
   lines.push(`exec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_VELA)} "$@"`, '');
   await writeFile(bin, lines.join('\n'), 'utf8');
   await chmod(bin, 0o755);
@@ -337,6 +557,7 @@ function snapshotEnv(): Record<string, string | undefined> {
     OPEN_DESIGN_TELEMETRY_RELAY_URL: process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL,
     POSTHOG_KEY: process.env.POSTHOG_KEY,
     POSTHOG_HOST: process.env.POSTHOG_HOST,
+    OD_NEXT_STRATEGY_ROLLOUT: process.env.OD_NEXT_STRATEGY_ROLLOUT,
   };
 }
 
@@ -357,19 +578,48 @@ function clearTelemetryEnv(): void {
 }
 
 async function putConfig(url: string, patch: Record<string, unknown>): Promise<void> {
+  const agentCliEnv =
+    patch.agentCliEnv && typeof patch.agentCliEnv === 'object'
+      ? patch.agentCliEnv as Record<string, unknown>
+      : {};
+  const amr =
+    agentCliEnv.amr && typeof agentCliEnv.amr === 'object'
+      ? agentCliEnv.amr as Record<string, unknown>
+      : {};
   const response = await fetch(`${url}/api/app-config`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(patch),
+    body: JSON.stringify({
+      ...patch,
+      agentCliEnv: {
+        ...agentCliEnv,
+        amr: {
+          ...amr,
+          VELA_RUNTIME_KEY: 'rt-amr-session-resume-test',
+          VELA_LINK_URL: 'https://amr-link.example.test/v1',
+        },
+      },
+    }),
   });
   expect(response.status).toBe(200);
 }
 
 async function createConversation(url: string): Promise<string> {
   const projectId = `amr_resume_${randomUUID()}`;
+  const workspaceId = `amr_resume_personal_${projectId}`;
+  const workspaceMemberId = `amr_resume_owner_${projectId}`;
+  const workspaceHeaders = {
+    'x-od-workspace-id': workspaceId,
+    'x-od-workspace-type': 'personal',
+    'x-od-workspace-member-id': workspaceMemberId,
+    'x-od-workspace-role': 'owner',
+  };
   const projectResponse = await fetch(`${url}/api/projects`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...workspaceHeaders,
+    },
     body: JSON.stringify({
       id: projectId,
       name: 'AMR resume smoke',
@@ -379,7 +629,12 @@ async function createConversation(url: string): Promise<string> {
   });
   expect(projectResponse.status).toBe(200);
   const projectBody = (await projectResponse.json()) as { conversationId: string; id: string };
-  return `${projectId}::${projectBody.conversationId}`;
+  return [
+    projectId,
+    projectBody.conversationId,
+    workspaceId,
+    workspaceMemberId,
+  ].join('::');
 }
 
 async function sendRunAndWait(
@@ -388,7 +643,11 @@ async function sendRunAndWait(
   message: string,
   model?: string,
 ): Promise<RunStatus> {
-  const [projectId, conversationId] = encoded.split('::');
+  const [projectId, conversationId, workspaceId, workspaceMemberId] =
+    encoded.split('::');
+  if (!projectId || !conversationId || !workspaceId || !workspaceMemberId) {
+    throw new Error(`invalid AMR resume fixture identity: ${encoded}`);
+  }
   const assistantMessageId = `assistant_amr_${randomUUID()}`;
   const runResponse = await fetch(`${url}/api/runs`, {
     method: 'POST',
@@ -397,6 +656,10 @@ async function sendRunAndWait(
       'x-od-analytics-device-id': 'amr-resume-test',
       'x-od-analytics-session-id': 'amr-resume-session',
       'x-od-analytics-client-type': 'web',
+      'x-od-workspace-id': workspaceId,
+      'x-od-workspace-type': 'personal',
+      'x-od-workspace-member-id': workspaceMemberId,
+      'x-od-workspace-role': 'owner',
     },
     body: JSON.stringify({
       projectId,
@@ -409,15 +672,31 @@ async function sendRunAndWait(
       ...(model ? { model } : {}),
     }),
   });
-  expect(runResponse.status).toBe(202);
-  const body = (await runResponse.json()) as { runId: string };
-  return await waitForRun(url, body.runId);
+  const body = (await runResponse.json()) as {
+    runId?: string;
+    error?: { code?: string; message?: string };
+  };
+  expect(runResponse.status, JSON.stringify(body)).toBe(202);
+  expect(body.runId).toBeTypeOf('string');
+  return await waitForRun(url, body.runId!, {
+    'x-od-workspace-id': workspaceId,
+    'x-od-workspace-type': 'personal',
+    'x-od-workspace-member-id': workspaceMemberId,
+    'x-od-workspace-role': 'owner',
+  });
 }
 
-async function waitForRun(url: string, runId: string): Promise<RunStatus> {
+async function waitForRun(
+  url: string,
+  runId: string,
+  headers: Record<string, string>,
+): Promise<RunStatus> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < 15_000) {
-    const response = await fetch(`${url}/api/runs/${encodeURIComponent(runId)}`);
+    const response = await fetch(
+      `${url}/api/runs/${encodeURIComponent(runId)}`,
+      { headers },
+    );
     expect(response.status).toBe(200);
     const run = (await response.json()) as RunStatus;
     if (run.status === 'failed' || run.status === 'succeeded' || run.status === 'canceled') {

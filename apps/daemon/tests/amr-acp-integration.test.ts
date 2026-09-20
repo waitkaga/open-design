@@ -22,7 +22,11 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { attachAcpSession, detectAcpModels } from '../src/agent-protocol/index.js';
-import { classifyAmrAccountFailure } from '../src/integrations/vela-errors.js';
+import { acpTelemetryToolCallId } from '../src/agent-protocol/acp/updates.js';
+import {
+  DEFAULT_AMR_RECHARGE_URL,
+  classifyAmrAccountFailure,
+} from '../src/integrations/vela-errors.js';
 import { AmrModelLoadingCache } from '../src/runtimes/amr-model-cache.js';
 import {
   amrAgentDef,
@@ -144,13 +148,8 @@ describe('AMR runtime def', () => {
     expect(def?.streamFormat).toBe('acp-json-rpc');
   });
 
-  it('builds the documented `vela agent run --runtime opencode` argv', () => {
-    expect(amrAgentDef.buildArgs()).toEqual([
-      'agent',
-      'run',
-      '--runtime',
-      'opencode',
-    ]);
+  it('builds the documented `vela agent run` argv', () => {
+    expect(amrAgentDef.buildArgs()).toEqual(['agent', 'run']);
   });
 
   it('fails closed instead of exposing static stale fallback models', () => {
@@ -198,6 +197,10 @@ describe('AMR runtime def', () => {
       'public_model_glm_5_1          vela',
       'public_model_claude_opus_4_6  vela',
       'public_model_gpt_image_2      vela',
+      'public_model_nano_banana_2    vela',
+      'public_model_nano_banana_2_lite vela',
+      'public_model_seedream_5_0     vela',
+      'public_model_seedream_5_0_pro vela',
       'vela/kimi-k2.6                vela',
       'public_model_seedance_2       vela',
       'public_model_deepseek_v3_2    vela',
@@ -212,6 +215,10 @@ describe('AMR runtime def', () => {
     ]);
     expect(models.every((model) => !model.label.includes('vela/'))).toBe(true);
     expect(models.map((model) => model.id)).not.toContain('gpt-image-2');
+    expect(models.map((model) => model.id)).not.toContain('nano-banana-2');
+    expect(models.map((model) => model.id)).not.toContain('nano-banana-2-lite');
+    expect(models.map((model) => model.id)).not.toContain('seedream-5-0');
+    expect(models.map((model) => model.id)).not.toContain('seedream-5-0-pro');
     expect(models.map((model) => model.id)).not.toContain('seedance-2');
   });
 
@@ -219,10 +226,24 @@ describe('AMR runtime def', () => {
     const models = parseVelaModelJson(JSON.stringify({
       source: 'remote',
       data: [
-        { id: 'public_model_kimi_k2_7_code' },
+        { id: 'public_model_kimi_k2_7_code', enabled: false },
         { id: 'public_model_deepseek_v3_2' },
-        { id: 'deepseek-v4-flash', cost: { input: 0.14, output: 0.28 } },
+        {
+          id: 'deepseek-v4-flash',
+          enabled: true,
+          default: true,
+          cost: { input: 0.14, output: 0.28 },
+          metadata: {
+            cost: 'low',
+            capability: 'standard',
+            contextWindowTokens: 200_000,
+          },
+        },
         { id: 'gpt-image-2' },
+        { id: 'nano-banana-2' },
+        { id: 'nano-banana-2-lite' },
+        { id: 'seedream-5.0' },
+        { id: 'seedream-5.0-pro' },
         { id: 'deepseek-v4-flash' },
       ],
     }), 'remote');
@@ -230,13 +251,24 @@ describe('AMR runtime def', () => {
       {
         id: 'deepseek-v4-flash',
         label: 'deepseek-v4-flash',
+        enabled: true,
+        default: true,
         inputPriceUsdPerMillion: 0.14,
         outputPriceUsdPerMillion: 0.28,
+        metadata: {
+          cost: 'low',
+          capability: 'standard',
+          contextWindowTokens: 200_000,
+        },
       },
       { id: 'deepseek-v3.2', label: 'deepseek-v3.2' },
-      { id: 'kimi-k2.7-code', label: 'kimi-k2.7-code' },
+      { id: 'kimi-k2.7-code', label: 'kimi-k2.7-code', enabled: false },
     ]);
     expect(models.map((m) => m.id)).not.toContain('gpt-image-2');
+    expect(models.map((m) => m.id)).not.toContain('nano-banana-2');
+    expect(models.map((m) => m.id)).not.toContain('nano-banana-2-lite');
+    expect(models.map((m) => m.id)).not.toContain('seedream-5.0');
+    expect(models.map((m) => m.id)).not.toContain('seedream-5.0-pro');
     expect(models.map((m) => m.id)).not.toContain('public_model_kimi_k2_7_code');
     expect(() => parseVelaModelJson(JSON.stringify({ source: 'preset', data: [] }), 'remote'))
       .toThrow(/expected remote/);
@@ -287,7 +319,7 @@ describe('AMR runtime def', () => {
         FAKE_VELA_MODEL_LIST_JSON: JSON.stringify({
           source: 'remote',
           data: [
-            { id: 'claude-fable-5' },
+            { id: 'claude-fable-5', metadata: { cost: 'medium', capability: 'best_quality' } },
             { id: 'claude-opus-4.6' },
             { id: 'mimo-v2.5-pro' },
             { id: 'gemini-3-flash-preview' },
@@ -301,24 +333,28 @@ describe('AMR runtime def', () => {
           label: 'claude-fable-5',
           inputPriceUsdPerMillion: 10,
           outputPriceUsdPerMillion: 50,
+          metadata: { cost: 'medium', capability: 'best_quality' },
         },
         {
           id: 'claude-opus-4.6',
           label: 'claude-opus-4.6',
           inputPriceUsdPerMillion: 5,
           outputPriceUsdPerMillion: 25,
+          metadata: { cost: 'very_high' },
         },
         {
           id: 'gemini-3-flash-preview',
           label: 'gemini-3-flash-preview',
           inputPriceUsdPerMillion: 0.5,
           outputPriceUsdPerMillion: 3,
+          metadata: { cost: 'low' },
         },
         {
           id: 'mimo-v2.5-pro',
           label: 'mimo-v2.5-pro',
           inputPriceUsdPerMillion: 1.74,
           outputPriceUsdPerMillion: 3.48,
+          metadata: { cost: 'high' },
         },
       ]);
     } finally {
@@ -609,6 +645,36 @@ describe('AMR model loading cache', () => {
       source: 'preset',
       models: [{ id: 'preset-prod', label: 'preset-prod' }],
       refreshing: true,
+    });
+  });
+
+  it('drops a cached remote catalog for a single environment when invalidated', async () => {
+    const cache = new AmrModelLoadingCache(60_000);
+    cache.warm('vela:local', async () => [{ id: 'locked-old', label: 'locked-old', enabled: false }]);
+    cache.warm('vela:prod', async () => [{ id: 'remote-prod', label: 'remote-prod' }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    cache.invalidate('vela:local');
+
+    const local = await cache.get('vela:local', {
+      fetchPreset: async () => [{ id: 'preset-local', label: 'preset-local' }],
+      fetchRemote: async () => [{ id: 'remote-local-new', label: 'remote-local-new', enabled: true }],
+    });
+    const prod = await cache.get('vela:prod', {
+      fetchPreset: async () => {
+        throw new Error('prod preset should not be required');
+      },
+      fetchRemote: async () => [{ id: 'remote-prod-new', label: 'remote-prod-new' }],
+    });
+
+    expect(local).toMatchObject({
+      source: 'preset',
+      models: [{ id: 'preset-local', label: 'preset-local' }],
+      refreshing: true,
+    });
+    expect(prod).toMatchObject({
+      source: 'remote',
+      models: [{ id: 'remote-prod', label: 'remote-prod' }],
     });
   });
 });
@@ -916,7 +982,7 @@ describe('AMR ACP transport — end-to-end against fake vela stub', () => {
     expect(classifyAmrAccountFailure(message)).toMatchObject({
       code: 'AMR_INSUFFICIENT_BALANCE',
       action: 'recharge',
-      actionUrl: 'https://open-design.ai/amr/wallet?source=open_design',
+      actionUrl: DEFAULT_AMR_RECHARGE_URL,
     });
   });
 
@@ -959,6 +1025,7 @@ describe('AMR ACP transport — end-to-end against fake vela stub', () => {
     expect(payload?.error?.details).toMatchObject({
       kind: 'amr_account',
       action: 'recharge',
+      actionUrl: DEFAULT_AMR_RECHARGE_URL,
     });
     expect(String(payload?.message ?? '')).toContain('AMR Cloud reported insufficient balance');
   });
@@ -1010,6 +1077,7 @@ describe('AMR ACP transport — end-to-end against fake vela stub', () => {
     expect(payload?.error?.details).toMatchObject({
       kind: 'amr_account',
       action: 'recharge',
+      actionUrl: DEFAULT_AMR_RECHARGE_URL,
       promoted_by: 'open_design_acp_retry_status',
     });
     expect(String(payload?.message ?? '')).toContain('AMR Cloud reported insufficient balance');
@@ -1049,6 +1117,7 @@ describe('AMR ACP transport — end-to-end against fake vela stub', () => {
     expect(payload?.error?.details).toMatchObject({
       kind: 'amr_account',
       action: 'recharge',
+      actionUrl: DEFAULT_AMR_RECHARGE_URL,
       promoted_by: 'open_design_acp_stderr_retry_status',
     });
     expect(String(payload?.message ?? '')).toContain('AMR Cloud reported insufficient balance');
@@ -1089,6 +1158,7 @@ describe('AMR ACP transport — end-to-end against fake vela stub', () => {
     expect(payload?.error?.details).toMatchObject({
       kind: 'amr_account',
       action: 'recharge',
+      actionUrl: DEFAULT_AMR_RECHARGE_URL,
       promoted_by: 'open_design_acp_stderr_retry_status',
     });
   });
@@ -1223,6 +1293,59 @@ describe('AMR ACP transport — end-to-end against fake vela stub', () => {
     expect(agentEvents).not.toContainEqual(expect.objectContaining({ type: 'tool_use' }));
   });
 
+  it('fails AMR turns when think-only tool completes via status-only frame (no title)', async () => {
+    // Sticky thinkOnly: pending title "Thinking" then terminal status-only must
+    // not emit tool_use and must still take the no-visible-output failure path.
+    const child = spawnAcpUpdateFixture(
+      [
+        {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'call_think',
+          title: 'Thinking',
+          status: 'pending',
+        },
+        {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call_think',
+          status: 'completed',
+        },
+      ],
+      { inputTokens: 10, outputTokens: 100, totalTokens: 110 },
+    );
+    const errors: Array<{ event: string; payload: unknown }> = [];
+    const agentEvents: unknown[] = [];
+    try {
+      const session = attachAcpSession({
+        child: child as never,
+        prompt: 'Generate a test',
+        cwd: process.cwd(),
+        model: 'step-3.7-flash',
+        mcpServers: [],
+        modelUnavailableErrorCode: 'AMR_MODEL_UNAVAILABLE',
+        send: (event, payload) => {
+          if (event === 'error') errors.push({ event, payload });
+          if (event === 'agent') agentEvents.push(payload);
+        },
+      });
+
+      await waitForExit(child);
+      expect(session.hasFatalError()).toBe(true);
+      expect(session.completedSuccessfully()).toBe(false);
+    } finally {
+      if (child.exitCode === null) child.kill('SIGTERM');
+    }
+
+    const payload = errors[0]?.payload as {
+      message?: unknown;
+      error?: { code?: unknown; retryable?: unknown; details?: Record<string, unknown> };
+    };
+    expect(String(payload?.message ?? '')).toContain('did not produce visible assistant text');
+    expect(payload?.error?.code).toBe('AGENT_EXECUTION_FAILED');
+    expect(payload?.error?.retryable).toBe(true);
+    expect(agentEvents).not.toContainEqual(expect.objectContaining({ type: 'tool_use' }));
+    expect(agentEvents).not.toContainEqual(expect.objectContaining({ type: 'tool_result' }));
+  });
+
   it('accepts ACP message chunks that carry text outside content.text', async () => {
     const child = spawnAcpUpdateFixture([
       {
@@ -1317,7 +1440,7 @@ describe('AMR ACP transport — end-to-end against fake vela stub', () => {
     expect(agentEvents).toContainEqual(
       expect.objectContaining({
         type: 'tool_use',
-        id: 'write_1',
+        id: acpTelemetryToolCallId('write_1'),
         name: 'Write',
         input: { file_path: 'index.html' },
       }),

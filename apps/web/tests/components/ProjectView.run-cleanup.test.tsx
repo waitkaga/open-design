@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import type { ComponentProps } from 'react';
-import { cleanup, render, waitFor } from '@testing-library/react';
+import { act, cleanup, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ProjectView,
@@ -15,7 +15,12 @@ import {
   resolveSucceededRunStatus,
   selectPrimaryProjectFile,
   shouldClearActiveRunRefs,
+  shouldReplayTerminalRunMessage,
 } from '../../src/components/ProjectView';
+import {
+  BRAND_BROWSER_TAB_ID,
+  registerBrandBrowser,
+} from '../../src/runtime/brand-browser-bridge';
 import type { Artifact, ChatMessage, ProjectFile } from '../../src/types';
 
 const listConversations = vi.fn();
@@ -38,9 +43,12 @@ const createConversation = vi.fn();
 const patchConversation = vi.fn();
 const patchProject = vi.fn();
 const patchPreviewCommentStatus = vi.fn();
+const upsertPreviewComment = vi.fn();
 const saveTabs = vi.fn();
 const writeProjectTextFile = vi.fn();
+const fetchProjectFileText = vi.fn();
 const cancelBrandExtraction = vi.fn();
+const continueBrandExtraction = vi.fn();
 const originalFetch = globalThis.fetch;
 
 const replayArtifact: Artifact = {
@@ -135,9 +143,10 @@ vi.mock('../../src/providers/registry', () => ({
   fetchProjectDesignSystemPackageAudit: (...args: unknown[]) => fetchProjectDesignSystemPackageAudit(...args),
   fetchLiveArtifacts: (...args: unknown[]) => fetchLiveArtifacts(...args),
   fetchProjectFiles: (...args: unknown[]) => fetchProjectFiles(...args),
+  fetchProjectFileText: (...args: unknown[]) => fetchProjectFileText(...args),
   fetchSkill: (...args: unknown[]) => fetchSkill(...args),
   patchPreviewCommentStatus: (...args: unknown[]) => patchPreviewCommentStatus(...args),
-  upsertPreviewComment: vi.fn(),
+  upsertPreviewComment: (...args: unknown[]) => upsertPreviewComment(...args),
   writeProjectTextFile: (...args: unknown[]) => writeProjectTextFile(...args),
 }));
 
@@ -150,6 +159,7 @@ vi.mock('../../src/runtime/brands', async () => {
   return {
     ...actual,
     cancelBrandExtraction: (...args: unknown[]) => cancelBrandExtraction(...args),
+    continueBrandExtraction: (...args: unknown[]) => continueBrandExtraction(...args),
   };
 });
 
@@ -184,7 +194,13 @@ const chatPaneSpy = vi.fn();
 vi.mock('../../src/components/ChatPane', () => ({
   ChatPane: (props: Record<string, unknown>) => {
     chatPaneSpy(props);
-    return null;
+    return (
+      <div className="pane">
+        <div className={`chat-log-wrap${props.chatLogTray ? ' has-chat-log-tray' : ''}`}>
+          {props.chatLogTray as ComponentProps<'div'>['children']}
+        </div>
+      </div>
+    );
   },
 }));
 
@@ -207,9 +223,28 @@ async function waitForReadyChatPaneProps() {
     expect(chatPaneSpy.mock.calls.at(-1)?.[0]?.sendDisabled).toBe(false);
   });
   return chatPaneSpy.mock.calls.at(-1)?.[0] as {
+    onBrandBrowserAssistConfirm?: (card: {
+      brandId: string;
+      browserTabId?: string;
+      reason?: string;
+      url?: string;
+    }) => Promise<{ ok: boolean; action?: string; message?: string } | void> | { ok: boolean; action?: string; message?: string } | void;
+    onContinueBrandExtraction?: () => void;
     onSend?: (prompt: string, attachments: unknown[], comments: unknown[]) => Promise<void>;
     initialDraft?: string;
   };
+}
+
+async function advanceTestClock(ms: number): Promise<void> {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+}
+
+async function settleTestClock(): Promise<void> {
+  for (let step = 0; step < 3; step += 1) {
+    await advanceTestClock(0);
+  }
 }
 
 describe('terminal replay artifact recovery', () => {
@@ -381,6 +416,15 @@ describe('selectPrimaryProjectFile', () => {
 
     expect(selectPrimaryProjectFile([sidecar, html])).toBe(html);
   });
+
+  it('does not treat Home-staged reference attachments as the initial artifact to open', () => {
+    const reference = projectFile('reference.png', 'image', 2_000);
+    const generated = projectFile('index.html', 'html', 1_000);
+    const homeAttachments = new Set(['reference.png']);
+
+    expect(selectPrimaryProjectFile([reference], homeAttachments)).toBeNull();
+    expect(selectPrimaryProjectFile([reference, generated], homeAttachments)).toBe(generated);
+  });
 });
 
 describe('retry target resolution', () => {
@@ -415,11 +459,13 @@ describe('retry target resolution', () => {
     });
   });
 
-  it('keeps earlier failed retry attempts visible while reusing the original user turn', () => {
+  it('keeps earlier delivery-failure retry attempts visible while reusing the original user turn', () => {
     const firstFailure: ChatMessage = {
       ...failedAssistant,
       id: 'assistant-1',
       content: 'First attempt produced partial output',
+      runStatus: 'succeeded',
+      resultDeliveryState: 'no_result',
       events: [{ kind: 'text', text: 'thinking before failure' }],
       producedFiles: [
         {
@@ -435,6 +481,8 @@ describe('retry target resolution', () => {
       ...failedAssistant,
       id: 'assistant-2',
       content: 'Retry failed too',
+      runStatus: 'succeeded',
+      resultDeliveryState: 'delivery_failed',
     };
 
     expect(resolveRetryTarget([userMessage, firstFailure, secondFailure], secondFailure.id)).toEqual({
@@ -466,6 +514,72 @@ describe('ProjectView daemon cleanup', () => {
     vi.useRealTimers();
     globalThis.fetch = originalFetch;
     window.sessionStorage.clear();
+  });
+
+  it('uses the routed conversation as the comment anchor while conversations hydrate', async () => {
+    listConversations.mockReturnValue(new Promise(() => {}));
+    listMessages.mockResolvedValue([]);
+    fetchPreviewComments.mockResolvedValue([]);
+    loadTabs.mockResolvedValue({ tabs: [], activeTabId: null });
+    fetchProjectFiles.mockResolvedValue([]);
+    fetchLiveArtifacts.mockResolvedValue([]);
+    fetchSkill.mockResolvedValue(null);
+    fetchDesignSystem.mockResolvedValue(null);
+    getTemplate.mockResolvedValue(null);
+    listActiveChatRuns.mockResolvedValue([]);
+    upsertPreviewComment.mockResolvedValue({
+      id: 'comment-1',
+      projectId: 'project-comment-route',
+      conversationId: 'conv-route',
+      note: 'Member QA comment',
+      target: { kind: 'point', x: 10, y: 20 },
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    render(
+      <ProjectView
+        project={{ id: 'project-comment-route', name: 'Project', skillId: null, designSystemId: null } as never}
+        routeFileName={null}
+        routeConversationId="conv-route"
+        config={{ mode: 'daemon', agentId: 'agent-1', notifications: undefined, agentModels: {} } as never}
+        agents={[{ id: 'agent-1', name: 'OpenCode', models: [] } as never]}
+        skills={[]}
+        designTemplates={[]}
+        designSystems={[]}
+        daemonLive
+        onModeChange={() => {}}
+        onAgentChange={() => {}}
+        onAgentModelChange={() => {}}
+        onRefreshAgents={() => {}}
+        onOpenSettings={() => {}}
+        onBack={() => {}}
+        onClearPendingPrompt={() => {}}
+        onTouchProject={() => {}}
+        onProjectChange={() => {}}
+        onProjectsRefresh={() => {}}
+      />,
+    );
+
+    await waitFor(() => expect(fileWorkspaceSpy).toHaveBeenCalled());
+    const onSavePreviewComment = fileWorkspaceSpy.mock.calls.at(-1)?.[0]
+      ?.onSavePreviewComment as (
+        target: { kind: 'point'; x: number; y: number },
+        note: string,
+        attachAfterSave: boolean,
+      ) => Promise<unknown>;
+
+    await expect(onSavePreviewComment(
+      { kind: 'point', x: 10, y: 20 },
+      'Member QA comment',
+      false,
+    )).resolves.toEqual(expect.objectContaining({ id: 'comment-1' }));
+    expect(upsertPreviewComment).toHaveBeenCalledWith(
+      'project-comment-route',
+      'conv-route',
+      expect.objectContaining({ note: 'Member QA comment' }),
+      null,
+    );
   });
 
   it('does not abort daemon cancel reattach controllers during unmount cleanup', async () => {
@@ -545,6 +659,68 @@ describe('ProjectView daemon cleanup', () => {
     expect(resolveSucceededRunStatus(undefined)).toBe('succeeded');
     expect(resolveSucceededRunStatus('failed')).toBe('failed');
     expect(resolveSucceededRunStatus('canceled')).toBe('canceled');
+  });
+
+  it('replays an unverified terminal Design-mode result after reload', () => {
+    expect(
+      shouldReplayTerminalRunMessage({
+        id: 'msg-unverified-delivery',
+        role: 'assistant',
+        content: 'I finished the design.',
+        runId: 'run-unverified-delivery',
+        runStatus: 'succeeded',
+        sessionMode: 'design',
+        // Realistic start time so the reconciliation age bound sees a fresh run.
+        startedAt: Date.now(),
+      }),
+    ).toBe(true);
+    expect(
+      shouldReplayTerminalRunMessage({
+        id: 'msg-chat-answer',
+        role: 'assistant',
+        content: 'Here is the answer.',
+        runId: 'run-chat-answer',
+        runStatus: 'succeeded',
+        sessionMode: 'chat',
+        startedAt: 1,
+      }),
+    ).toBe(false);
+  });
+
+  it('does not auto-replay a historical succeeded Design message whose delivery never materialized', () => {
+    // #6505: a Design-mode success persisted days ago with delivery metadata
+    // absent must not be replayed/reattached on every reload — only a freshly
+    // completed run gets the one bounded reconciliation. Without an age bound,
+    // `designDeliveryVerificationPending` stays true forever and ProjectView
+    // re-enters the replay path on each recovery tick.
+    expect(
+      shouldReplayTerminalRunMessage({
+        id: 'msg-historical-delivery',
+        role: 'assistant',
+        content: 'I finished the design.',
+        runId: 'run-historical-delivery',
+        runStatus: 'succeeded',
+        sessionMode: 'design',
+        startedAt: 1,
+        endedAt: Date.now() - 24 * 60 * 60 * 1000,
+      }),
+    ).toBe(false);
+  });
+
+  it('does not auto-replay a legacy succeeded Design row that has no endedAt', () => {
+    // #6505 rows persisted before `endedAt` existed carry only `startedAt`; the
+    // age bound must still flag them stale so a reload stops auto-replaying.
+    expect(
+      shouldReplayTerminalRunMessage({
+        id: 'msg-legacy-no-ended-at',
+        role: 'assistant',
+        content: 'I finished the design.',
+        runId: 'run-legacy-no-ended-at',
+        runStatus: 'succeeded',
+        sessionMode: 'design',
+        startedAt: Date.now() - 24 * 60 * 60 * 1000,
+      }),
+    ).toBe(false);
   });
 
   // Regression: a phantom 'running' row in DB (no runId, no matching active
@@ -932,6 +1108,173 @@ describe('ProjectView daemon cleanup', () => {
     expect(window.sessionStorage.getItem('od:auto-send-first:brand-project')).toBeNull();
   });
 
+  it('opens browser assist without adding a global download-guide toast', async () => {
+    listConversations.mockResolvedValue([{ id: 'conv-brand', title: 'Conversation' }]);
+    listMessages.mockResolvedValue([]);
+    fetchPreviewComments.mockResolvedValue([]);
+    loadTabs.mockResolvedValue({ tabs: [], activeTabId: null });
+    fetchProjectFiles.mockResolvedValue([]);
+    fetchLiveArtifacts.mockResolvedValue([]);
+    fetchSkill.mockResolvedValue(null);
+    fetchDesignSystem.mockResolvedValue(null);
+    getTemplate.mockResolvedValue(null);
+    listActiveChatRuns.mockResolvedValue([]);
+    streamViaDaemon.mockResolvedValue(undefined);
+
+    chatPaneSpy.mockClear();
+    fileWorkspaceSpy.mockClear();
+
+    render(
+      <ProjectView
+        project={{
+          id: 'brand-project',
+          name: 'Refly Design System',
+          skillId: null,
+          designSystemId: null,
+          metadata: {
+            kind: 'brand',
+            importedFrom: 'brand-extraction',
+            brandId: 'refly-ai',
+            brandSourceUrl: 'https://refly.ai/',
+          },
+          createdAt: 1,
+          updatedAt: 1,
+        } as never}
+        routeFileName={null}
+        config={{ mode: 'daemon', agentId: 'agent-1', notifications: undefined, agentModels: {} } as never}
+        agents={[{ id: 'agent-1', name: 'OpenCode', models: [] } as never]}
+        skills={[]}
+        designTemplates={[]}
+        designSystems={[]}
+        daemonLive
+        onModeChange={() => {}}
+        onAgentChange={() => {}}
+        onAgentModelChange={() => {}}
+        onRefreshAgents={() => {}}
+        onOpenSettings={() => {}}
+        onBack={() => {}}
+        onClearPendingPrompt={() => {}}
+        onTouchProject={() => {}}
+        onProjectChange={() => {}}
+        onProjectsRefresh={() => {}}
+      />,
+    );
+
+    const chatProps = await waitForReadyChatPaneProps();
+    expect(chatProps.onBrandBrowserAssistConfirm).toBeTypeOf('function');
+
+    let result: { ok: boolean; action?: string; message?: string } | void = undefined;
+    await act(async () => {
+      result = await chatProps.onBrandBrowserAssistConfirm?.({
+        brandId: 'refly-ai',
+        browserTabId: 'brand-browser-tab',
+        reason: 'Cloudflare',
+        url: 'https://refly.ai/',
+      });
+    });
+
+    expect(result).toMatchObject({ ok: true, action: 'opened' });
+    await waitFor(() => {
+      expect(fileWorkspaceSpy.mock.calls.at(-1)?.[0]?.browserOpenRequest).toMatchObject({
+        tabId: 'brand-browser-tab',
+        url: 'https://refly.ai/',
+        attentionAction: 'download-page',
+      });
+    });
+
+    expect(document.querySelector('.project-actions-toast-anchor .od-toast')).toBeNull();
+  });
+
+  it('anchors continue-extraction snapshot errors in the chat pane', async () => {
+    // Continue extraction snapshot failures should stay between the transcript
+    // and the composer, without resurrecting the long download-guide details
+    // that now live beside the Browser download action.
+    listConversations.mockResolvedValue([{ id: 'conv-brand', title: 'Conversation' }]);
+    listMessages.mockResolvedValue([]);
+    fetchPreviewComments.mockResolvedValue([]);
+    loadTabs.mockResolvedValue({ tabs: [], activeTabId: null });
+    fetchProjectFiles.mockResolvedValue([]);
+    fetchLiveArtifacts.mockResolvedValue([]);
+    fetchSkill.mockResolvedValue(null);
+    fetchDesignSystem.mockResolvedValue(null);
+    getTemplate.mockResolvedValue(null);
+    listActiveChatRuns.mockResolvedValue([]);
+    streamViaDaemon.mockResolvedValue(undefined);
+    // No saved page archive on disk…
+    fetchProjectFileText.mockResolvedValue(null);
+    // …and the daemon cannot finish programmatically either.
+    continueBrandExtraction.mockResolvedValue({ ok: false, error: 'still walled' });
+
+    // A mounted desktop Browser tab whose live DOM and page-snapshot download
+    // both fail, so the flow lands on a contained snapshot error toast.
+    registerBrandBrowser('brand-project', BRAND_BROWSER_TAB_ID, {
+      executeJavaScript: () => null,
+      downloadPageSnapshot: async () => ({ ok: false, message: 'snapshot save failed' }),
+      getURL: () => 'https://refly.ai/',
+      isDesktopWebview: true,
+    });
+
+    chatPaneSpy.mockClear();
+    fileWorkspaceSpy.mockClear();
+
+    try {
+      render(
+        <ProjectView
+          project={{
+            id: 'brand-project',
+            name: 'Refly Design System',
+            skillId: null,
+            designSystemId: null,
+            metadata: {
+              kind: 'brand',
+              importedFrom: 'brand-extraction',
+              brandId: 'refly-ai',
+              brandSourceUrl: 'https://refly.ai/',
+            },
+            createdAt: 1,
+            updatedAt: 1,
+          } as never}
+          routeFileName={null}
+          config={{ mode: 'daemon', agentId: 'agent-1', notifications: undefined, agentModels: {} } as never}
+          agents={[{ id: 'agent-1', name: 'OpenCode', models: [] } as never]}
+          skills={[]}
+          designTemplates={[]}
+          designSystems={[]}
+          daemonLive
+          onModeChange={() => {}}
+          onAgentChange={() => {}}
+          onAgentModelChange={() => {}}
+          onRefreshAgents={() => {}}
+          onOpenSettings={() => {}}
+          onBack={() => {}}
+          onClearPendingPrompt={() => {}}
+          onTouchProject={() => {}}
+          onProjectChange={() => {}}
+          onProjectsRefresh={() => {}}
+        />,
+      );
+
+      const chatProps = await waitForReadyChatPaneProps();
+      expect(chatProps.onContinueBrandExtraction).toBeTypeOf('function');
+
+      await act(async () => {
+        chatProps.onContinueBrandExtraction?.();
+      });
+
+      const toast = await waitFor(() => {
+        const node = document.querySelector('.od-toast');
+        expect(node?.textContent).toContain('snapshot save failed');
+        return node as HTMLElement;
+      });
+      expect(toast.textContent).not.toContain('chat.brandBrowserAssistDownloadGuideDetails');
+      expect(toast.closest('.project-actions-toast-anchor')).toBeTruthy();
+      expect(toast.closest('.split-chat-slot')).toBeTruthy();
+      expect(toast.closest('.chat-log-wrap')?.className).toContain('has-chat-log-tray');
+    } finally {
+      registerBrandBrowser('brand-project', BRAND_BROWSER_TAB_ID, null);
+    }
+  });
+
   it('waits for pendingPrompt hydration before consuming an auto-send flag', async () => {
     listConversations.mockResolvedValue([{ id: 'conv-1', title: 'Conversation' }]);
     listMessages.mockResolvedValue([]);
@@ -1022,7 +1365,10 @@ describe('ProjectView daemon cleanup', () => {
     listMessages.mockResolvedValue([]);
     fetchPreviewComments.mockResolvedValue([]);
     loadTabs.mockResolvedValue({ tabs: [], activeTabId: null });
-    fetchProjectFiles.mockResolvedValue([]);
+    fetchProjectFiles.mockResolvedValue([
+      projectFile('brief.pdf', 'pdf', 1),
+      projectFile('logo.png', 'image', 2),
+    ]);
     fetchLiveArtifacts.mockResolvedValue([]);
     fetchSkill.mockResolvedValue(null);
     fetchDesignSystem.mockResolvedValue(null);
@@ -1085,6 +1431,10 @@ describe('ProjectView daemon cleanup', () => {
       });
       expect(window.sessionStorage.getItem('od:auto-send-first:project-files')).toBeNull();
       expect(window.sessionStorage.getItem('od:auto-send-attachments:project-files')).toBeNull();
+      expect(saveTabs).not.toHaveBeenCalledWith(
+        'project-files',
+        expect.objectContaining({ active: expect.stringMatching(/brief\.pdf|logo\.png/) }),
+      );
     } finally {
       window.sessionStorage.removeItem('od:auto-send-first:project-files');
       window.sessionStorage.removeItem('od:auto-send-attachments:project-files');
@@ -1345,7 +1695,9 @@ describe('ProjectView daemon cleanup', () => {
       />,
     );
 
-    await waitFor(() => expect(fetchProjectDesignSystemPackageAudit).toHaveBeenCalledWith('project-ds'));
+    await waitFor(() =>
+      expect(fetchProjectDesignSystemPackageAudit).toHaveBeenCalledWith('project-ds', null),
+    );
     await waitFor(() => expect(streamViaDaemon).toHaveBeenCalled());
     expect(window.sessionStorage.getItem('od:design-system-audit-auto-repair:project-ds')).toBe('1');
     await waitFor(() => {
@@ -1435,7 +1787,9 @@ describe('ProjectView daemon cleanup', () => {
     const chatProps = await waitForReadyChatPaneProps();
     await chatProps.onSend!('Update the design system', [], []);
 
-    await waitFor(() => expect(fetchProjectDesignSystemPackageAudit).toHaveBeenCalledWith('project-ds-manual'));
+    await waitFor(() =>
+      expect(fetchProjectDesignSystemPackageAudit).toHaveBeenCalledWith('project-ds-manual', null),
+    );
     await waitFor(() => {
       expect(saveMessage.mock.calls.some((call) =>
         call[2]?.role === 'assistant'
@@ -1516,7 +1870,9 @@ describe('ProjectView daemon cleanup', () => {
       />,
     );
 
-    await waitFor(() => expect(fetchProjectDesignSystemPackageAudit).toHaveBeenCalledWith('project-ds-pass'));
+    await waitFor(() =>
+      expect(fetchProjectDesignSystemPackageAudit).toHaveBeenCalledWith('project-ds-pass', null),
+    );
     expect(streamViaDaemon).toHaveBeenCalledTimes(1);
     expect(window.sessionStorage.getItem('od:design-system-audit-auto-repair:project-ds-pass')).toBeNull();
   });
@@ -1877,6 +2233,85 @@ describe('ProjectView daemon cleanup', () => {
     ).toBe(true);
   });
 
+  it('threads the captured stderr tail from a live daemon failure onto the assistant message', async () => {
+    // The failure card's copy promises "the original error is collected under
+    // 「view details」". For a whole family of failures the daemon's own message
+    // is generic and the real cause exists only in the stderr it captured, so
+    // the live onError path has to carry that onto the assistant message —
+    // otherwise the card can only ever repeat the generic sentence.
+    const stderrTail =
+      'Error: dsh: plugin tree failed to load: credentials-local: the value for "version" in /Users/tester/.dsh/.credentials.yaml must be a string';
+    listConversations.mockResolvedValue([{ id: 'conv-1', title: 'Conversation' }]);
+    listMessages.mockResolvedValue([]);
+    fetchPreviewComments.mockResolvedValue([]);
+    loadTabs.mockResolvedValue({ tabs: [], activeTabId: null });
+    fetchProjectFiles.mockResolvedValue([]);
+    fetchLiveArtifacts.mockResolvedValue([]);
+    fetchSkill.mockResolvedValue(null);
+    fetchDesignSystem.mockResolvedValue(null);
+    getTemplate.mockResolvedValue(null);
+    listActiveChatRuns.mockResolvedValue([]);
+    streamViaDaemon.mockImplementation(async (options: {
+      onRunCreated?: (runId: string) => void;
+      handlers: { onError: (error: Error) => void };
+    }) => {
+      options.onRunCreated?.('run-stderr-tail-1');
+      const err = new Error('DeepSeek Harness profile exited without a terminal result.') as Error & {
+        code?: string;
+        stderrTail?: string;
+      };
+      err.code = 'DSH_PROFILE_MISSING_RESULT';
+      err.stderrTail = stderrTail;
+      options.handlers.onError(err);
+    });
+
+    chatPaneSpy.mockClear();
+
+    render(
+      <ProjectView
+        project={{ id: 'project-stderr-tail', name: 'Project', skillId: null, designSystemId: null } as never}
+        routeFileName={null}
+        config={{ mode: 'daemon', agentId: 'agent-1', notifications: undefined, agentModels: {} } as never}
+        agents={[{ id: 'agent-1', name: 'OpenCode', models: [] } as never]}
+        skills={[]}
+        designTemplates={[]}
+        designSystems={[]}
+        daemonLive
+        onModeChange={() => {}}
+        onAgentChange={() => {}}
+        onAgentModelChange={() => {}}
+        onRefreshAgents={() => {}}
+        onOpenSettings={() => {}}
+        onBack={() => {}}
+        onClearPendingPrompt={() => {}}
+        onTouchProject={() => {}}
+        onProjectChange={() => {}}
+        onProjectsRefresh={() => {}}
+      />,
+    );
+
+    const sendProps = await waitForReadyChatPaneProps();
+    await sendProps!.onSend!('do the thing', [], []);
+
+    await waitFor(() => expect(streamViaDaemon).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      const latest = chatPaneSpy.mock.calls.at(-1)?.[0] as {
+        messages?: Array<{
+          role: string;
+          runStatus?: string;
+          events?: Array<{ kind?: string; label?: string; stderrTail?: string }>;
+        }>;
+      };
+      const failed = latest?.messages?.find(
+        (m) => m.role === 'assistant' && m.runStatus === 'failed',
+      );
+      const errorEvent = failed?.events?.find(
+        (event) => event.kind === 'status' && event.label === 'error',
+      );
+      expect(errorEvent?.stderrTail).toBe(stderrTail);
+    });
+  });
+
   it('does not replay a terminal succeeded row with empty produced files', async () => {
     const runCreatedAt = Date.now();
     const existingArtifact = {
@@ -1964,7 +2399,12 @@ describe('ProjectView daemon cleanup', () => {
       />,
     );
 
-    await waitFor(() => expect(fetchProjectFiles).toHaveBeenCalledWith('project-1'));
+    await waitFor(() =>
+      expect(fetchProjectFiles).toHaveBeenCalledWith('project-1', {
+        requireAuthoritative: true,
+        workspaceContext: null,
+      }),
+    );
     expect(fetchChatRunStatus).not.toHaveBeenCalled();
     expect(reattachDaemonRun).not.toHaveBeenCalled();
     expect(saveMessage).not.toHaveBeenCalledWith(
@@ -2041,7 +2481,9 @@ describe('ProjectView daemon cleanup', () => {
       />,
     );
 
-    await waitFor(() => expect(fetchChatRunStatus).toHaveBeenCalledWith('run-legacy-replay'));
+    await waitFor(() =>
+      expect(fetchChatRunStatus).toHaveBeenCalledWith('run-legacy-replay', null),
+    );
     await waitFor(() => {
       expect(saveMessage).toHaveBeenCalledWith(
         'project-1',
@@ -2139,6 +2581,7 @@ describe('ProjectView daemon cleanup', () => {
   });
 
   it('keeps reattaching after two generic disconnects while daemon status stays running, but backs off before the next retry', async () => {
+    vi.useFakeTimers();
     const runCreatedAt = Date.now();
     const genericDisconnect = await createGenericDisconnectError();
 
@@ -2201,118 +2644,137 @@ describe('ProjectView daemon cleanup', () => {
       />,
     );
 
-    await waitFor(() => expect(reattachDaemonRun.mock.calls.length).toBeGreaterThanOrEqual(2), {
-      timeout: 2_000,
-    });
-    expect(reattachDaemonRun.mock.calls.length).toBe(2);
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    expect(reattachDaemonRun.mock.calls.length).toBe(2);
-    await waitFor(() => expect(reattachDaemonRun.mock.calls.length).toBeGreaterThanOrEqual(3), {
-      timeout: 4_500,
-    });
-  }, 12_000);
+    await settleTestClock();
+    expect(reattachDaemonRun).toHaveBeenCalledTimes(2);
 
-  it('clears streaming after a slow retry-cap status probe on reattach generic disconnects', async () => {
-    const runCreatedAt = Date.now();
-    const genericDisconnect = await createGenericDisconnectError();
-    type RunningStatusProbe = {
-      id: string;
-      status: 'running';
-      createdAt: number;
-      updatedAt: number;
-      exitCode: null;
-      signal: null;
-    };
-    let resolveStatusProbe!: (value: RunningStatusProbe) => void;
-    const statusProbe = new Promise<RunningStatusProbe>((resolve) => {
-      resolveStatusProbe = resolve;
-    });
+    await advanceTestClock(2_999);
+    expect(reattachDaemonRun).toHaveBeenCalledTimes(2);
+    await advanceTestClock(1);
+    await settleTestClock();
+    expect(reattachDaemonRun.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
 
-    listConversations.mockResolvedValue([{ id: 'conv-1', title: 'Conversation' }]);
-    listMessages.mockResolvedValue([
-      {
-        id: 'msg-reattach-slow-status-probe',
-        role: 'assistant',
-        content: '',
-        createdAt: runCreatedAt,
-        startedAt: runCreatedAt,
-        runId: 'run-reattach-slow-status-probe',
-        runStatus: 'failed',
-        producedFiles: [],
-      },
-    ]);
-    fetchPreviewComments.mockResolvedValue([]);
-    loadTabs.mockResolvedValue({ tabs: [], activeTabId: null });
-    fetchProjectFiles.mockResolvedValue([]);
-    fetchProjectDesignSystemPackageAudit.mockResolvedValue(null);
-    fetchLiveArtifacts.mockResolvedValue([]);
-    fetchSkill.mockResolvedValue(null);
-    fetchDesignSystem.mockResolvedValue(null);
-    getTemplate.mockResolvedValue(null);
-    listActiveChatRuns.mockResolvedValue([]);
-    let statusChecks = 0;
-    fetchChatRunStatus.mockImplementation(async () => {
-      statusChecks += 1;
-      if (statusChecks === 3) return statusProbe;
-      return {
+  it.each([
+    {
+      label: 'running',
+      resolveStatusProbe: (runCreatedAt: number) => ({
         id: 'run-reattach-slow-status-probe',
         status: 'running' as const,
         createdAt: runCreatedAt,
-        updatedAt: runCreatedAt + statusChecks,
+        updatedAt: runCreatedAt + 3,
         exitCode: null,
         signal: null,
+      }),
+    },
+    {
+      label: 'null',
+      resolveStatusProbe: () => null,
+    },
+  ])(
+    'retries reattach generic-disconnect recovery after cleanup when the capped status probe resolves as $label after the backoff fires',
+    async ({ resolveStatusProbe }) => {
+      const runCreatedAt = Date.now();
+      const genericDisconnect = await createGenericDisconnectError();
+      type RunningStatusProbe = {
+        id: string;
+        status: 'running';
+        createdAt: number;
+        updatedAt: number;
+        exitCode: null;
+        signal: null;
       };
-    });
-    reattachDaemonRun.mockImplementation(async (options: {
-      handlers: { onError: (error: Error) => Promise<void> };
-    }) => {
-      void options.handlers.onError(genericDisconnect);
-    });
+      let resolvePendingStatusProbe!: (value: RunningStatusProbe | null) => void;
+      const statusProbe = new Promise<RunningStatusProbe | null>((resolve) => {
+        resolvePendingStatusProbe = resolve;
+      });
 
-    render(
-      <ProjectView
-        project={{ id: 'project-reattach-slow-status-probe', name: 'Project', skillId: null, designSystemId: null } as never}
-        routeFileName={null}
-        config={{ mode: 'daemon', agentId: 'agent-1', notifications: undefined, agentModels: {} } as never}
-        agents={[{ id: 'agent-1', name: 'OpenCode', models: [] } as never]}
-        skills={[]}
-        designTemplates={[]}
-        designSystems={[]}
-        daemonLive
-        onModeChange={() => {}}
-        onAgentChange={() => {}}
-        onAgentModelChange={() => {}}
-        onRefreshAgents={() => {}}
-        onOpenSettings={() => {}}
-        onBack={() => {}}
-        onClearPendingPrompt={() => {}}
-        onTouchProject={() => {}}
-        onProjectChange={() => {}}
-        onProjectsRefresh={() => {}}
-      />,
-    );
+      listConversations.mockResolvedValue([{ id: 'conv-1', title: 'Conversation' }]);
+      listMessages.mockResolvedValue([
+        {
+          id: 'msg-reattach-slow-status-probe',
+          role: 'assistant',
+          content: '',
+          createdAt: runCreatedAt,
+          startedAt: runCreatedAt,
+          runId: 'run-reattach-slow-status-probe',
+          runStatus: 'failed',
+          producedFiles: [],
+        },
+      ]);
+      fetchPreviewComments.mockResolvedValue([]);
+      loadTabs.mockResolvedValue({ tabs: [], activeTabId: null });
+      fetchProjectFiles.mockResolvedValue([]);
+      fetchProjectDesignSystemPackageAudit.mockResolvedValue(null);
+      fetchLiveArtifacts.mockResolvedValue([]);
+      fetchSkill.mockResolvedValue(null);
+      fetchDesignSystem.mockResolvedValue(null);
+      getTemplate.mockResolvedValue(null);
+      listActiveChatRuns.mockResolvedValue([]);
+      let statusChecks = 0;
+      fetchChatRunStatus.mockImplementation(async () => {
+        statusChecks += 1;
+        if (statusChecks === 3) return statusProbe;
+        return {
+          id: 'run-reattach-slow-status-probe',
+          status: 'running' as const,
+          createdAt: runCreatedAt,
+          updatedAt: runCreatedAt + statusChecks,
+          exitCode: null,
+          signal: null,
+        };
+      });
+      reattachDaemonRun.mockImplementation(async (options: {
+        handlers: { onError: (error: Error) => Promise<void> };
+      }) => {
+        void options.handlers.onError(genericDisconnect);
+      });
 
-    await waitFor(() => {
-      expect(reattachDaemonRun).toHaveBeenCalledTimes(2);
-      expect(fetchChatRunStatus).toHaveBeenCalledTimes(3);
+      render(
+        <ProjectView
+          project={{ id: 'project-reattach-slow-status-probe', name: 'Project', skillId: null, designSystemId: null } as never}
+          routeFileName={null}
+          config={{ mode: 'daemon', agentId: 'agent-1', notifications: undefined, agentModels: {} } as never}
+          agents={[{ id: 'agent-1', name: 'OpenCode', models: [] } as never]}
+          skills={[]}
+          designTemplates={[]}
+          designSystems={[]}
+          daemonLive
+          onModeChange={() => {}}
+          onAgentChange={() => {}}
+          onAgentModelChange={() => {}}
+          onRefreshAgents={() => {}}
+          onOpenSettings={() => {}}
+          onBack={() => {}}
+          onClearPendingPrompt={() => {}}
+          onTouchProject={() => {}}
+          onProjectChange={() => {}}
+          onProjectsRefresh={() => {}}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(reattachDaemonRun).toHaveBeenCalledTimes(2);
+        expect(fetchChatRunStatus).toHaveBeenCalledTimes(3);
+        expect(chatPaneSpy.mock.calls.at(-1)?.[0]?.streaming).toBe(false);
+        expect(chatPaneSpy.mock.calls.at(-1)?.[0]?.sendDisabled).toBe(false);
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 3_200));
+      const reattachCallsBeforeProbeResolve = reattachDaemonRun.mock.calls.length;
+
+      resolvePendingStatusProbe(resolveStatusProbe(runCreatedAt));
+
+      await waitFor(
+        () => expect(reattachDaemonRun.mock.calls.length).toBeGreaterThan(reattachCallsBeforeProbeResolve),
+        {
+          timeout: 4_000,
+        },
+      );
       expect(chatPaneSpy.mock.calls.at(-1)?.[0]?.streaming).toBe(false);
       expect(chatPaneSpy.mock.calls.at(-1)?.[0]?.sendDisabled).toBe(false);
-    });
-
-    resolveStatusProbe({
-      id: 'run-reattach-slow-status-probe',
-      status: 'running',
-      createdAt: runCreatedAt,
-      updatedAt: runCreatedAt + 3,
-      exitCode: null,
-      signal: null,
-    });
-
-    await waitFor(() => {
-      expect(chatPaneSpy.mock.calls.at(-1)?.[0]?.streaming).toBe(false);
-      expect(chatPaneSpy.mock.calls.at(-1)?.[0]?.sendDisabled).toBe(false);
-    });
-  });
+    },
+    12_000,
+  );
 
   it('keeps live-stream recovery retryable after two generic disconnects while daemon status stays running, but backs off before the next retry', async () => {
     const runCreatedAt = Date.now();
@@ -2371,19 +2833,19 @@ describe('ProjectView daemon cleanup', () => {
     );
 
     const sendProps = await waitForReadyChatPaneProps();
+    vi.useFakeTimers();
     await sendProps!.onSend!('flaky stream', [], []);
 
-    await waitFor(() => expect(streamViaDaemon).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(reattachDaemonRun.mock.calls.length).toBeGreaterThanOrEqual(1), {
-      timeout: 2_000,
-    });
-    expect(reattachDaemonRun.mock.calls.length).toBe(1);
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    expect(reattachDaemonRun.mock.calls.length).toBe(1);
-    await waitFor(() => expect(reattachDaemonRun.mock.calls.length).toBeGreaterThanOrEqual(2), {
-      timeout: 4_500,
-    });
-  }, 12_000);
+    await settleTestClock();
+    expect(streamViaDaemon).toHaveBeenCalledTimes(1);
+    expect(reattachDaemonRun).toHaveBeenCalledTimes(1);
+
+    await advanceTestClock(2_999);
+    expect(reattachDaemonRun).toHaveBeenCalledTimes(1);
+    await advanceTestClock(1);
+    await settleTestClock();
+    expect(reattachDaemonRun.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
 
   it('keeps a partial live generic disconnect recoverable after the first failure', async () => {
     const runCreatedAt = Date.now();
@@ -2555,6 +3017,7 @@ describe('ProjectView daemon cleanup', () => {
   });
 
   it('keeps generic-disconnect cap retryable when the follow-up status probe returns null, but backs off before retrying', async () => {
+    vi.useFakeTimers();
     const runCreatedAt = Date.now();
     const genericDisconnect = await createGenericDisconnectError();
 
@@ -2635,16 +3098,15 @@ describe('ProjectView daemon cleanup', () => {
       />,
     );
 
-    await waitFor(() => expect(reattachDaemonRun.mock.calls.length).toBeGreaterThanOrEqual(2), {
-      timeout: 2_000,
-    });
-    expect(reattachDaemonRun.mock.calls.length).toBe(2);
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    expect(reattachDaemonRun.mock.calls.length).toBe(2);
-    await waitFor(() => expect(reattachDaemonRun.mock.calls.length).toBeGreaterThanOrEqual(3), {
-      timeout: 4_500,
-    });
-  }, 12_000);
+    await settleTestClock();
+    expect(reattachDaemonRun).toHaveBeenCalledTimes(2);
+
+    await advanceTestClock(2_999);
+    expect(reattachDaemonRun).toHaveBeenCalledTimes(2);
+    await advanceTestClock(1);
+    await settleTestClock();
+    expect(reattachDaemonRun.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
 
   it('finalizes a reattach generic disconnect as succeeded when the next status poll turns terminal', async () => {
     const runCreatedAt = Date.now();
@@ -3516,6 +3978,7 @@ describe('ProjectView daemon cleanup', () => {
         'conv-1',
         'comment-1',
         'needs_review',
+        null,
       );
     });
   });
@@ -3684,7 +4147,7 @@ describe('ProjectView daemon cleanup', () => {
           call[2]?.runStatus === 'canceled' &&
           call[2]?.resumable === true &&
           call[2]?.events === preservedEvents &&
-          call[3] === undefined,
+          call[3]?.workspaceContext === null,
       );
       expect(canceledSave).toBeTruthy();
     });
@@ -3846,6 +4309,7 @@ describe('ProjectView daemon cleanup', () => {
     render(
       <ProjectView
         project={{ id: 'project-recover-failed', name: 'Project', skillId: null, designSystemId: null } as never}
+        initialWorkspaceScope={{ kind: 'unbound', projectId: 'project-recover-failed', workspaceId: null, context: null }}
         routeFileName={null}
         config={{ mode: 'daemon', agentId: 'agent-1', notifications: undefined, agentModels: {} } as never}
         agents={[{ id: 'agent-1', name: 'OpenCode', models: [] } as never]}
@@ -3932,6 +4396,7 @@ describe('ProjectView daemon cleanup', () => {
     render(
       <ProjectView
         project={{ id: 'project-css-recover', name: 'Project', skillId: null, designSystemId: null } as never}
+        initialWorkspaceScope={{ kind: 'unbound', projectId: 'project-css-recover', workspaceId: null, context: null }}
         routeFileName={null}
         config={{ mode: 'daemon', agentId: 'agent-1', notifications: undefined, agentModels: {} } as never}
         agents={[{ id: 'agent-1', name: 'OpenCode', models: [] } as never]}
@@ -3960,6 +4425,7 @@ describe('ProjectView daemon cleanup', () => {
       expect.objectContaining({
         artifactManifest: expect.objectContaining({ entry: 'theme.css' }),
       }),
+      null,
     );
   });
 
@@ -4058,6 +4524,7 @@ describe('ProjectView daemon cleanup', () => {
       expect.objectContaining({
         artifactManifest: expect.objectContaining({ entry: 'real-daemon-smoke.html' }),
       }),
+      null,
     );
     expect(saveTabs).not.toHaveBeenCalledWith('project-1', expect.objectContaining({ active: 'index.html' }));
   });

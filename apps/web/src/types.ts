@@ -6,8 +6,12 @@ import type {
   AgentCliEnvIntentPrefs,
   AgentModelPrefs,
   AgentTestRequest,
+  AppRuntimeCapabilities,
   AppVersionInfo,
   AppVersionResponse,
+  WhatsNewContent,
+  WhatsNewLocaleContent,
+  WhatsNewResponse,
   AudioKind,
   ChatAttachment,
   ChatCommentAttachment,
@@ -64,6 +68,7 @@ import type {
   PreviewAnnotationStyle,
   PreviewCommentSelectionKind,
   PreviewComment,
+  PreviewCommentAnchorState,
   PreviewCommentAttachment,
   PreviewCommentStatus,
   PreviewCommentTarget,
@@ -84,6 +89,7 @@ import type {
   SkillDetail,
   SkillSummary,
   InstallInput,
+  InstallSkillRequest,
   InstallSkillResponse,
   InstallDesignSystemResponse,
   UninstallResponse,
@@ -140,7 +146,7 @@ export function liveArtifactIdFromTabId(tabId: LiveArtifactTabId): string {
 // Side Chat tab convention. A `chat:<conversationId>` tab mounts a secondary
 // ChatPane bound to that conversation (Stage 2), mirroring the `live:` scheme
 // above. The conversation is a normal conversation, so it also shows up in the
-// header ConversationsMenu.
+// conversation list.
 export type SideChatTabId = `chat:${string}`;
 
 export function sideChatTabId(conversationId: string): SideChatTabId {
@@ -341,14 +347,13 @@ export interface PetCustom {
 }
 
 export interface NotificationsConfig {
-  // Master switch for the completion sound. Default false — first-run users
-  // hear nothing until they opt in.
+  // Master switch for the completion sound. Default true; users can opt out.
   soundEnabled: boolean;
   // Sound id played when a turn ends with `runStatus === 'succeeded'`.
   successSoundId: string;
   // Sound id played when a turn ends with `runStatus === 'failed'`.
   failureSoundId: string;
-  // Master switch for the browser Notification API banner. Default false.
+  // Master switch for the browser Notification API banner. Default true.
   desktopEnabled: boolean;
 }
 
@@ -358,6 +363,10 @@ export interface OrbitConfig {
   time: string;
   /** Optional skill id from the examples gallery where scenario === "orbit". */
   templateSkillId?: string | null;
+  workspaceScope?: {
+    workspaceId: string;
+    workspaceMemberId: string;
+  } | null;
 }
 
 export interface PetConfig {
@@ -396,6 +405,8 @@ export interface AppConfig {
   apiProtocolConfigs?: Partial<Record<ApiProtocol, ApiProtocolConfig>>;
   /** BYOK provider drafts keyed by protocol + selected provider base URL. */
   byokProviderConfigDrafts?: Record<string, ByokProviderConfigDraft>;
+  /** Provider draft restored first when Settings returns to BYOK. */
+  byokPendingProviderKey?: string;
   /** Internal config schema/migration version for localStorage upgrades. */
   configMigrationVersion?: number;
   /** Base URL of the selected known provider; cleared once the user customizes provider fields. */
@@ -446,6 +457,7 @@ export interface AppConfig {
   // resolved. This is independent from installationId so Delete my data can
   // rotate or clear the anonymous id without re-opening the consent banner.
   privacyDecisionAt?: number | null;
+  allowSilentUpdates?: boolean;
   // Privacy preferences governing what (if anything) is shipped to the
   // PostHog / Langfuse telemetry endpoints. `metrics` and `content`
   // default ON (set by `DEFAULT_CONFIG.telemetry` in state/config.ts) so
@@ -518,11 +530,25 @@ export interface ExamplePreview {
   html: string;
 }
 
+export type ModelCost = 'low' | 'medium' | 'high' | 'very_high';
+
+export type ModelCapability = 'standard' | 'advanced' | 'best_quality';
+
+export interface ModelMetadata {
+  cost?: ModelCost;
+  capability?: ModelCapability;
+}
+
 export interface AgentModelOption {
   id: string;
   label: string;
+  enabled?: boolean;
+  default?: boolean;
   inputPriceUsdPerMillion?: number;
   outputPriceUsdPerMillion?: number;
+  metadata?: ModelMetadata;
+  additionalSpeedTiers?: string[];
+  serviceTierOptions?: AgentModelOption[];
 }
 
 export type Surface = 'web' | 'image' | 'video' | 'audio';
@@ -557,8 +583,12 @@ export type {
   AgentDiagnostic,
   AgentFixIntent,
   AgentTestRequest,
+  AppRuntimeCapabilities,
   AppVersionInfo,
   AppVersionResponse,
+  WhatsNewContent,
+  WhatsNewLocaleContent,
+  WhatsNewResponse,
   AudioKind,
   ConnectionTestKind,
   ConnectionTestProtocol,
@@ -593,6 +623,7 @@ export type {
   Project,
   ProjectPlatform,
   PreviewComment,
+  PreviewCommentAnchorState,
   PreviewCommentAttachment,
   PreviewCommentStatus,
   PreviewCommentTarget,
@@ -617,6 +648,7 @@ export type {
   SkillDetail,
   SkillSummary,
   InstallInput,
+  InstallSkillRequest,
   InstallSkillResponse,
   InstallDesignSystemResponse,
   UninstallResponse,

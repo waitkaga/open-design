@@ -143,6 +143,39 @@ describe('OnboardingDropdown', () => {
     expect(screen.queryByText('No compatible text models were returned.')).toBeNull();
   });
 
+  it('only treats an empty option as selected when explicitly allowed', () => {
+    const options = [
+      { value: '', label: 'Azure OpenAI' },
+      { value: 'https://api.example.test', label: 'Example provider' },
+    ];
+
+    const { rerender } = render(
+      <OnboardingDropdown
+        label="Provider"
+        placeholder="Custom provider"
+        value=""
+        options={options}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /Custom provider/ })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Azure OpenAI/ })).toBeNull();
+
+    rerender(
+      <OnboardingDropdown
+        label="Provider"
+        placeholder="Custom provider"
+        value=""
+        options={options}
+        onChange={vi.fn()}
+        allowEmptyValue
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /Azure OpenAI/ })).toBeTruthy();
+  });
+
   it('renders model tag and cost metadata as option text', () => {
     render(
       <OnboardingDropdown
@@ -153,9 +186,9 @@ describe('OnboardingDropdown', () => {
           {
             value: 'deepseek-v4-flash',
             label: 'deepseek-v4-flash',
-            meta: 'Lowest cost',
-            tag: 'Fast',
-            tagKind: 'fast',
+            meta: 'Low cost',
+            tag: 'Standard',
+            tagKind: 'standard',
           },
         ]}
         onChange={vi.fn()}
@@ -165,10 +198,10 @@ describe('OnboardingDropdown', () => {
     fireEvent.click(screen.getByRole('button', { name: /deepseek-v4-flash/ }));
 
     const option = screen.getByRole('option', { name: /^deepseek-v4-flash$/ });
-    expect(option.textContent).toContain('Lowest cost');
-    expect(option.textContent).toContain('Fast');
+    expect(option.textContent).toContain('Low cost');
+    expect(option.textContent).toContain('Standard');
     expect(option).toHaveAccessibleName('deepseek-v4-flash');
-    expect(option).toHaveAccessibleDescription('Lowest cost Fast');
+    expect(option).toHaveAccessibleDescription('Low cost Standard');
     expect(option.querySelector('[data-description]')).toBeNull();
     expect(option.querySelector('[data-label]')).toBeNull();
   });

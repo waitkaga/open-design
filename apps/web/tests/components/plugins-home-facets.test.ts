@@ -88,6 +88,55 @@ describe('extractCategories', () => {
     ).toEqual(['hyperframes']);
   });
 
+  // OPEND-3118: the bundled document examples are prototype-mode plugins whose
+  // tags name a document (résumé, docs site, PRD, invoice, data report, the
+  // parchment letter). They used to fall under 原型 → 文档 / 报告, which left the
+  // Community 文档 tab empty. `document` now precedes `prototype`, keyed on that
+  // same docs-reports tag group, so they land in exactly one tab: 文档.
+  it('classifies the bundled document examples as document, ahead of prototype', () => {
+    const documentExamples: Array<[string, string[]]> = [
+      ['example-resume-modern', ['example', 'prototype', 'personal', 'resume', 'cv']],
+      ['example-docs-page', ['example', 'prototype', 'engineering', 'docs', 'documentation', 'guide', 'tutorial', 'api-reference']],
+      ['example-pm-spec', ['example', 'prototype', 'product', 'prd', 'spec', 'product-spec']],
+      ['example-invoice', ['example', 'prototype', 'finance', 'invoice', 'bill']],
+      ['example-data-report', ['example', 'prototype', 'finance', 'data', 'report', 'chart']],
+      ['example-doc-kami-parchment', ['example', 'prototype', 'personal', 'kami', 'editorial', 'report', 'letter', 'one-pager']],
+    ];
+    for (const [id, tags] of documentExamples) {
+      expect(extractCategories(fixture({ id, tags, od: { mode: 'prototype' } })), id).toEqual(['document']);
+      // Document is flat: no scene row under it.
+      expect(extractSubcategories(fixture({ id, tags, od: { mode: 'prototype' } })), id).toEqual([]);
+    }
+    // Only prototype-mode plugins qualify — a deck about a report is still a deck,
+    // an image poster tagged `resume` is still an image.
+    expect(extractCategories(fixture({ id: 'report-deck', tags: ['report'], od: { mode: 'deck' } }))).toEqual(['deck']);
+    expect(extractCategories(fixture({ id: 'resume-poster', tags: ['resume'], od: { mode: 'image' } }))).toEqual(['image']);
+  });
+
+  // OPEND-3098: the bundled `webgl-*` examples carry webgl / webgl2 / shader /
+  // gpu tags on prototype mode. They get their own kind so the Community WebGL
+  // tab has cards and 原型 stops listing them as brand pages.
+  it('classifies the bundled webgl examples as webgl, ahead of prototype', () => {
+    const webglExamples: Array<[string, string[]]> = [
+      ['example-webgl-aurora-veil', ['hero', 'webgl', 'webgl2', 'shader', 'generative']],
+      ['example-webgl-caustic-pool', ['hero', 'webgl', 'webgl2', 'shader', 'water']],
+      ['example-webgl-depth-gallery', ['gallery', '3d', 'webgl', 'three.js', 'scroll']],
+      ['example-webgl-distortion-grain', ['gallery', 'webgl', 'three.js', 'shader']],
+      ['example-webgl-experience', ['prototype', 'web', 'webgl', 'webgl2', 'shader', '3d', 'gpu']],
+      ['example-webgl-halftone-drift', ['hero', 'webgl', 'webgl2', 'shader', 'halftone']],
+      ['example-webgl-liquid-metal', ['prototype', 'web', 'webgl', 'webgl2', 'shader', 'gpu']],
+      ['example-webgl-neon-grid', ['prototype', 'web', 'webgl', 'webgl2', 'shader', 'gpu']],
+      ['example-webgl-particle-galaxy', ['prototype', 'web', 'webgl', 'webgl2', 'shader', 'gpu']],
+      ['example-webgl-raymarched-hero', ['prototype', 'web', 'webgl', 'webgl2', 'shader', '3d', 'gpu']],
+    ];
+    for (const [id, tags] of webglExamples) {
+      expect(extractCategories(fixture({ id, tags, od: { mode: 'prototype' } })), id).toEqual(['webgl']);
+      expect(extractSubcategories(fixture({ id, tags, od: { mode: 'prototype' } })), id).toEqual([]);
+    }
+    // A single qualifying slug is enough.
+    expect(extractCategories(fixture({ id: 'shader-only', tags: ['shader'], od: { mode: 'prototype' } }))).toEqual(['webgl']);
+  });
+
   it('keeps non-artifact workflow and design-system plugins out of primary tabs', () => {
     expect(extractCategories(fixture({ id: 'design-system', od: { mode: 'design-system' } }))).toEqual([]);
     expect(extractCategories(fixture({ id: 'import', od: { taskKind: 'figma-migration', mode: 'scenario' } }))).toEqual([]);
@@ -108,17 +157,26 @@ describe('extractSubcategories', () => {
     expect(extractSubcategories(fixture({ id: 'app', tags: ['mobile-app'], od: { mode: 'prototype' } }))).toEqual(['app-prototypes']);
     expect(extractSubcategories(fixture({ id: 'landing', tags: ['saas-landing'], od: { mode: 'prototype' } }))).toEqual(['landing-marketing']);
     expect(extractSubcategories(fixture({ id: 'dev', tags: ['engineering'], od: { mode: 'prototype' } }))).toEqual(['developer-tools']);
-    expect(extractSubcategories(fixture({ id: 'clinical', tags: ['case-report'], od: { mode: 'prototype' } }))).toEqual(['docs-reports']);
+    // OPEND-3118: docs / reports are their own kind now (`document`), so no
+    // prototype scene bucket names them any more.
+    expect(extractCategories(fixture({ id: 'clinical', tags: ['case-report'], od: { mode: 'prototype' } }))).toEqual(['document']);
+    expect(extractSubcategories(fixture({ id: 'clinical', tags: ['case-report'], od: { mode: 'prototype' } }))).toEqual([]);
     expect(extractSubcategories(fixture({ id: 'brand', tags: ['wireframe'], od: { mode: 'prototype' } }))).toEqual(['brand-design']);
   });
 
-  it('maps deck templates to pitch, course, report, product, engineering, and creative scenes', () => {
-    expect(extractSubcategories(fixture({ id: 'pitch', tags: ['pitch-deck'], od: { mode: 'deck' } }))).toEqual(['pitch-business']);
-    expect(extractSubcategories(fixture({ id: 'course', tags: ['course-module'], od: { mode: 'deck' } }))).toEqual(['course-training']);
-    expect(extractSubcategories(fixture({ id: 'report', tags: ['weekly-report'], od: { mode: 'deck' } }))).toEqual(['reports-briefings']);
-    expect(extractSubcategories(fixture({ id: 'launch', tags: ['product-launch'], od: { mode: 'deck' } }))).toEqual(['product-sales']);
-    expect(extractSubcategories(fixture({ id: 'tech', tags: ['tech-sharing'], od: { mode: 'deck' } }))).toEqual(['engineering-talks']);
-    expect(extractSubcategories(fixture({ id: 'creative', tags: ['zhangzara'], od: { mode: 'deck' } }))).toEqual(['creative-decks']);
+  // Deck scenes are the 15 commercial "品类" buckets, resolved from the plugin's
+  // commercial category id (od.category / a category tag / od.scenario) rather
+  // than tag-slug heuristics, so the filter row shares one taxonomy with the
+  // per-card category chip.
+  it('maps deck templates to their commercial scene by resolved category id', () => {
+    expect(extractSubcategories(fixture({ id: 'pitch', od: { mode: 'deck', category: 'fundraising-pitch' } }))).toEqual(['fundraising-pitch']);
+    expect(extractSubcategories(fixture({ id: 'board', od: { mode: 'deck', category: 'corporate-strategy' } }))).toEqual(['corporate-strategy']);
+    expect(extractSubcategories(fixture({ id: 'sales', od: { mode: 'deck', category: 'b2b-sales' } }))).toEqual(['b2b-sales']);
+    expect(extractSubcategories(fixture({ id: 'craft', od: { mode: 'deck', category: 'design-craft' } }))).toEqual(['design-craft']);
+    // A category tag resolves the scene when od.category is absent.
+    expect(extractSubcategories(fixture({ id: 'tagged', tags: ['ai-literacy'], od: { mode: 'deck' } }))).toEqual(['ai-literacy']);
+    // A deck with no resolvable commercial category lands in no scene bucket.
+    expect(extractSubcategories(fixture({ id: 'bare', tags: ['pitch-deck'], od: { mode: 'deck' } }))).toEqual([]);
   });
 
   it('maps image templates to visual-scene buckets', () => {
@@ -138,10 +196,11 @@ describe('extractSubcategories', () => {
     expect(extractSubcategories(fixture({ id: 'cinema', tags: ['cinematic'], od: { mode: 'video' } }))).toEqual(['cinematic-story']);
   });
 
-  // Regression: the rail/catalog display order (SUBCATEGORY_DISPLAY_ORDER) must
-  // NOT change which bucket an overlapping-tag plugin lands in. Bucketing is
-  // decided by SUBCATEGORIES matching precedence, which stays stable even
-  // though Brand / design and Creative decks render first in the rails.
+  // Regression: the prototype/image/video rail display order
+  // (SUBCATEGORY_DISPLAY_ORDER) must NOT change which bucket an overlapping-tag
+  // plugin lands in. Bucketing is decided by SUBCATEGORIES matching precedence,
+  // which stays stable even though Brand / design renders first in the rails.
+  // (Decks are exempt: their bucket is the single resolved commercial category.)
   it('keeps bucket membership stable for overlapping-tag plugins regardless of display order', () => {
     // `dashboard` + `design`: stays in Dashboards (not Brand / design).
     expect(
@@ -155,14 +214,6 @@ describe('extractSubcategories', () => {
     expect(
       extractSubcategories(fixture({ id: 'landing-brand', tags: ['saas-landing', 'brand'], od: { mode: 'prototype' } })),
     ).toEqual(['landing-marketing']);
-    // launch deck + `marketing`: stays in Product / sales (not Creative decks).
-    expect(
-      extractSubcategories(fixture({ id: 'launch', tags: ['product-launch', 'marketing'], od: { mode: 'deck' } })),
-    ).toEqual(['product-sales']);
-    // pitch deck + `marketing`: stays in Pitch / business (not Creative decks).
-    expect(
-      extractSubcategories(fixture({ id: 'pitch-mkt', tags: ['pitch-deck', 'marketing'], od: { mode: 'deck' } })),
-    ).toEqual(['pitch-business']);
   });
 
   it('keeps Live Artifact, HyperFrames, and Audio flat with no second-level buckets', () => {
@@ -191,12 +242,16 @@ describe('buildFacetCatalog', () => {
       fixture({ id: 'hf', tags: ['hyperframes'], od: { mode: 'video' } }),
       fixture({ id: 'audio', od: { mode: 'audio' } }),
       fixture({ id: 'design-system', od: { mode: 'design-system' } }),
+      fixture({ id: 'resume', tags: ['resume'], od: { mode: 'prototype' } }),
+      fixture({ id: 'neon', tags: ['webgl'], od: { mode: 'prototype' } }),
     ]);
 
     expect(catalog.category.map((o) => [o.slug, o.count])).toEqual([
+      ['deck', 1],
+      ['document', 1],
+      ['webgl', 1],
       ['prototype', 1],
       ['live-artifact', 1],
-      ['deck', 1],
       ['image', 1],
       ['video', 1],
       ['hyperframes', 1],
@@ -210,15 +265,27 @@ describe('buildFacetCatalog', () => {
       'business-dashboards',
       'app-prototypes',
       'developer-tools',
-      'docs-reports',
     ]);
+    // Document and WebGL are flat kinds, like HyperFrames and Audio.
+    expect(catalog.subcategory.document).toBeUndefined();
+    expect(catalog.subcategory.webgl).toBeUndefined();
+    // Deck scenes: the 15 commercial "品类" buckets in commercial-priority order.
     expect((catalog.subcategory.deck ?? []).map((o) => o.slug)).toEqual([
-      'creative-decks',
-      'engineering-talks',
-      'pitch-business',
-      'course-training',
-      'reports-briefings',
-      'product-sales',
+      'fundraising-pitch',
+      'corporate-strategy',
+      'b2b-sales',
+      'product-management',
+      'design-craft',
+      'marketing-gtm',
+      'data-finance',
+      'consulting',
+      'government-policy',
+      'professional-training',
+      'academic-research',
+      'ai-literacy',
+      'career',
+      'student-coursework',
+      'life',
     ]);
     expect((catalog.subcategory.image ?? []).map((o) => o.slug)).toEqual([
       'ui-product-mockups',
@@ -246,7 +313,7 @@ describe('applyFacetSelection', () => {
     fixture({ id: 'prototype-dashboard', tags: ['dashboard'], od: { mode: 'prototype' } }),
     fixture({ id: 'prototype-app', tags: ['mobile-app'], od: { mode: 'prototype' } }),
     fixture({ id: 'example-live-artifact', tags: ['live-artifact'], od: { mode: 'prototype' } }),
-    fixture({ id: 'deck', tags: ['pitch-deck'], od: { mode: 'deck' } }),
+    fixture({ id: 'deck', od: { mode: 'deck', category: 'fundraising-pitch' } }),
     fixture({ id: 'image', tags: ['profile-avatar'], od: { mode: 'image' } }),
     fixture({ id: 'video', tags: ['cinematic'], od: { mode: 'video' } }),
     fixture({ id: 'hf', tags: ['hyperframes'], od: { mode: 'video' } }),
@@ -290,6 +357,10 @@ describe('applyFacetSelection', () => {
     expect(
       applyFacetSelection(plugins, { category: 'prototype', subcategory: 'app-prototypes' }).map((p) => p.id),
     ).toEqual(['prototype-app']);
+    // Deck scene bucket = the plugin's resolved commercial category.
+    expect(
+      applyFacetSelection(plugins, { category: 'deck', subcategory: 'fundraising-pitch' }).map((p) => p.id),
+    ).toEqual(['deck']);
   });
 });
 
@@ -303,25 +374,25 @@ describe('isFeaturedPlugin', () => {
 });
 
 describe('resolveDefaultSelection', () => {
-  it('defaults the home catalog to Prototype when that bucket exists', () => {
+  it('defaults the home catalog to Slides when that bucket exists', () => {
     const catalog = buildFacetCatalog([
       fixture({ id: 'slides', od: { mode: 'deck' } }),
       fixture({ id: 'prototype', od: { mode: 'prototype' } }),
     ]);
 
     expect(resolveDefaultSelection(catalog)).toEqual({
-      category: 'prototype',
+      category: 'deck',
       subcategory: null,
     });
   });
 
-  it('falls back to the first populated artifact kind when Prototype is unavailable', () => {
+  it('falls back to the first populated artifact kind when Slides is unavailable', () => {
     const catalog = buildFacetCatalog([
-      fixture({ id: 'slides', od: { mode: 'deck' } }),
+      fixture({ id: 'prototype', od: { mode: 'prototype' } }),
     ]);
 
     expect(resolveDefaultSelection(catalog)).toEqual({
-      category: 'deck',
+      category: 'prototype',
       subcategory: null,
     });
   });
